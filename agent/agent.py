@@ -335,60 +335,111 @@ def _agent_id(cfg):
     return cfg['agent_id']
 
 
-def setup_dialog(cfg):
-    """Tiny Tkinter dialog to capture server + EMS credentials. Returns True if
-    enrollment was submitted successfully (agent now pending approval)."""
-    import tkinter as tk
-    from tkinter import messagebox
+def _fetch_offices(server):
+    try:
+        r = requests.get(server + '/api/win/offices', timeout=10)
+        if r.ok:
+            return r.json().get('offices') or []
+    except Exception:
+        pass
+    return []
 
+
+def setup_dialog(cfg):
+    """First-run: pick an Office/location + type a Name, then register this PC.
+    The unique ID is shown so the admin can identify it. Returns True on submit."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    server = (cfg.get('server') or DEFAULT_SERVER).rstrip('/')
+    agent_id = _agent_id(cfg)
+    offices = _fetch_offices(server)
     result = {'ok': False}
+
     root = tk.Tk()
     root.title('winMon Setup — Rajiv Syndicate')
-    root.geometry('380x260')
-    root.resizable(False, False)
+    root.geometry('420x330'); root.resizable(False, False)
 
-    tk.Label(root, text='Computer Monitoring Setup', font=('Segoe UI', 13, 'bold')).pack(pady=(16, 4))
-    tk.Label(root, text='Sign in with your EMS credentials', fg='#666').pack()
+    tk.Label(root, text='Computer Monitoring — Setup', font=('Segoe UI', 13, 'bold')).pack(pady=(16, 2))
+    tk.Label(root, text='This PC will be registered for monitoring.', fg='#666').pack()
 
-    frm = tk.Frame(root); frm.pack(pady=12, padx=20, fill='x')
-    tk.Label(frm, text='Server').grid(row=0, column=0, sticky='w', pady=4)
-    e_srv = tk.Entry(frm, width=28); e_srv.grid(row=0, column=1, pady=4)
-    e_srv.insert(0, cfg.get('server') or DEFAULT_SERVER)
-    tk.Label(frm, text='Employee ID').grid(row=1, column=0, sticky='w', pady=4)
-    e_eid = tk.Entry(frm, width=28); e_eid.grid(row=1, column=1, pady=4)
-    tk.Label(frm, text='Password').grid(row=2, column=0, sticky='w', pady=4)
-    e_pw = tk.Entry(frm, width=28, show='•'); e_pw.grid(row=2, column=1, pady=4)
+    frm = tk.Frame(root); frm.pack(pady=12, padx=22, fill='x')
+    tk.Label(frm, text='Server').grid(row=0, column=0, sticky='w', pady=5)
+    e_srv = tk.Entry(frm, width=30); e_srv.grid(row=0, column=1, pady=5); e_srv.insert(0, server)
+    tk.Label(frm, text='Office / Location').grid(row=1, column=0, sticky='w', pady=5)
+    off_var = tk.StringVar()
+    cb = ttk.Combobox(frm, width=27, textvariable=off_var, values=offices)
+    cb.grid(row=1, column=1, pady=5)
+    tk.Label(frm, text='Name (this PC)').grid(row=2, column=0, sticky='w', pady=5)
+    e_name = tk.Entry(frm, width=30); e_name.grid(row=2, column=1, pady=5)
 
-    status = tk.Label(root, text='', fg='#c00'); status.pack()
+    tk.Label(root, text='Unique ID: ' + agent_id, font=('Consolas', 9), fg='#2563eb').pack()
+    status = tk.Label(root, text='', fg='#c00', wraplength=380); status.pack()
 
     def submit():
         srv = e_srv.get().strip().rstrip('/') or DEFAULT_SERVER
-        eid = e_eid.get().strip()
-        pw = e_pw.get()
-        if not eid or not pw:
-            status.config(text='Enter Employee ID and password.'); return
+        office = off_var.get().strip()
+        name = e_name.get().strip()
+        if not office or not name:
+            status.config(text='Enter the office/location and a name for this PC.'); return
         try:
-            r = requests.post(srv + '/api/win/enroll', json={
-                'employee_id': eid, 'password': pw, 'agent_id': _agent_id(cfg),
+            r = requests.post(srv + '/api/win/register', json={
+                'agent_id': agent_id, 'office': office, 'name': name,
                 'hostname': socket.gethostname(), 'os_user': getpass.getuser(),
                 'app_version': APP_VERSION,
             }, timeout=15)
-            if r.status_code == 401:
-                status.config(text='Invalid EMS credentials.'); return
             if not r.ok:
-                status.config(text='Enroll failed (%s).' % r.status_code); return
-            cfg['server'] = srv; cfg['employee_id'] = eid
+                status.config(text='Registration failed (%s).' % r.status_code); return
+            cfg['server'] = srv; cfg['office'] = office; cfg['name'] = name
             save_cfg(cfg)
             result['ok'] = True
-            messagebox.showinfo('winMon', 'Submitted. Ask Head Office to approve this PC.\nMonitoring will start automatically once approved.')
+            messagebox.showinfo('winMon',
+                'Registered!\n\nUnique ID: %s\n\nAsk Head Office to approve this PC in EMS.\n'
+                'Monitoring starts automatically once approved.' % agent_id)
             root.destroy()
         except Exception as ex:
             status.config(text='Network error: %s' % ex)
 
-    tk.Button(root, text='Enroll', command=submit, width=16,
-              bg='#2563eb', fg='white', font=('Segoe UI', 10, 'bold')).pack(pady=10)
+    tk.Button(root, text='Register this PC', command=submit, width=20,
+              bg='#2563eb', fg='white', font=('Segoe UI', 10, 'bold')).pack(pady=12)
     root.mainloop()
     return result['ok']
+
+
+def show_status_dialog(cfg):
+    """Shown when the user re-opens the app: displays the unique ID + status so
+    they can read it out to the admin, and whether it's approved / has a problem."""
+    import tkinter as tk
+    server = (cfg.get('server') or DEFAULT_SERVER).rstrip('/')
+    agent_id = _agent_id(cfg)
+    status_txt, color = 'Checking…', '#666'
+    try:
+        r = requests.get(server + '/api/win/session', params={'agent_id': agent_id}, timeout=10)
+        st = (r.json() or {}).get('status') if r.ok else None
+        status_txt, color = {
+            'active': ('Approved — monitoring is running', '#16a34a'),
+            'pending': ('Waiting for Head Office approval', '#d97706'),
+            'denied': ('Denied by Head Office', '#dc2626'),
+            'revoked': ('Revoked by Head Office', '#dc2626'),
+            'none': ('Not registered', '#dc2626'),
+        }.get(st, (str(st), '#666'))
+    except Exception:
+        status_txt, color = 'Cannot reach server — check network', '#dc2626'
+
+    root = tk.Tk(); root.title('winMon — This PC'); root.geometry('440x250'); root.resizable(False, False)
+    tk.Label(root, text='Computer Monitoring', font=('Segoe UI', 13, 'bold')).pack(pady=(18, 2))
+    tk.Label(root, text=(cfg.get('name') or '') + ('  ·  ' + cfg.get('office') if cfg.get('office') else ''),
+             fg='#333', font=('Segoe UI', 10)).pack()
+    tk.Label(root, text='Unique ID', fg='#666', font=('Segoe UI', 9)).pack(pady=(14, 0))
+    idbox = tk.Entry(root, width=42, font=('Consolas', 10), justify='center', bd=1, relief='solid')
+    idbox.pack(pady=2); idbox.insert(0, agent_id); idbox.config(state='readonly')
+
+    def copyid():
+        root.clipboard_clear(); root.clipboard_append(agent_id)
+    tk.Button(root, text='Copy ID', command=copyid, width=12).pack(pady=6)
+    tk.Label(root, text=status_txt, fg=color, font=('Segoe UI', 10, 'bold'), wraplength=400).pack(pady=8)
+    tk.Button(root, text='Close', command=root.destroy, width=12).pack(pady=4)
+    root.mainloop()
 
 
 # ── main tracking loop ─────────────────────────────────────────────────────────
@@ -448,6 +499,14 @@ class Tracker:
         try:
             requests.post(self.server + '/api/win/health', headers=self._headers(),
                           json=snap, timeout=15)
+        except Exception:
+            pass
+
+    def report_error(self, msg):
+        """Push an agent problem to EMS so it shows on the dashboard."""
+        try:
+            requests.post(self.server + '/api/win/error', headers=self._headers(),
+                          json={'error': str(msg)[:500]}, timeout=10)
         except Exception:
             pass
 
@@ -666,24 +725,41 @@ class Tracker:
         self.scan_software()
         last_upload = last_health = last_shot = last_sw = time.time()
         while self.token:
-            self.sample()
-            now = time.time()
-            self.run_detectors()   # cheap: USB + print each sample
-            if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
-                self.capture_screenshot()
-                last_shot = now
-            if now - last_sw >= 300:               # software scan every 5 min
-                self.scan_software()
-                last_sw = now
-            if now - last_upload >= self.upload_int:
-                self.upload()
-                self.fetch_config()   # pick up screenshot/intensity toggles
-                self.fetch_policy()   # refresh block/allow lists
-                last_upload = now
-            if now - last_health >= self.health_int:
-                self.send_health()
-                last_health = now
+            try:
+                self.sample()
+                now = time.time()
+                self.run_detectors()   # cheap: USB + print each sample
+                if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
+                    self.capture_screenshot()
+                    last_shot = now
+                if now - last_sw >= 300:               # software scan every 5 min
+                    self.scan_software()
+                    last_sw = now
+                if now - last_upload >= self.upload_int:
+                    self.upload()
+                    self.fetch_config()   # pick up screenshot/intensity toggles
+                    self.fetch_policy()   # refresh block/allow lists
+                    last_upload = now
+                if now - last_health >= self.health_int:
+                    self.send_health()
+                    last_health = now
+            except Exception as ex:
+                self.report_error('%s: %s' % (type(ex).__name__, ex))
             time.sleep(self.sample_int)
+
+
+def _acquire_single_instance():
+    """Return a bound socket if we are the first/only monitor process, else None.
+    Used so re-opening the app while it's already running just shows the status."""
+    import socket as _s
+    try:
+        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 0)
+        srv.bind(('127.0.0.1', 49517))
+        srv.listen(1)
+        return srv
+    except OSError:
+        return None
 
 
 def main():
@@ -692,29 +768,42 @@ def main():
         return
     cfg = load_cfg()
     _agent_id(cfg)
-    # First run (or after deny/revoke): capture credentials + enroll.
+
+    # Not registered yet → first-run setup (office + name), then start monitoring.
+    if not cfg.get('office') or not cfg.get('name'):
+        if not setup_dialog(cfg):
+            return
+        cfg = load_cfg()
+
+    # Already registered. If a monitor is already running, this launch is the
+    # user asking "show my ID / status" → display it and exit.
+    lock = _acquire_single_instance()
+    if lock is None:
+        show_status_dialog(cfg)
+        return
+
+    # We are the monitor process.
     while True:
-        if not cfg.get('employee_id'):
-            if not setup_dialog(cfg):
-                return
-            cfg = load_cfg()
         t = Tracker(cfg)
         if not t.token:
             res = t.wait_for_approval()
             if res is None:
-                # denied/revoked → force re-enroll
-                cfg['employee_id'] = None; cfg['token'] = None; save_cfg(cfg)
+                # denied/revoked → ask the user to re-register (office/name)
+                cfg['token'] = None; save_cfg(cfg)
+                if not setup_dialog(cfg):
+                    return
                 cfg = load_cfg()
                 continue
             cfg = load_cfg(); t.token = cfg.get('token')
         try:
             t.run()
-        except Exception:
-            pass
+        except Exception as ex:
+            try:
+                t.report_error('fatal: %s' % ex)
+            except Exception:
+                pass
         # token dropped (revoked) → loop back and wait for re-approval
         cfg = load_cfg()
-        if not cfg.get('token'):
-            cfg['employee_id'] = cfg.get('employee_id')  # keep id, just re-wait
         time.sleep(5)
 
 

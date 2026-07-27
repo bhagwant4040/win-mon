@@ -1,0 +1,43 @@
+name: Build winMon.exe
+
+# Builds the Windows agent into a single winMon.exe in the cloud (GitHub's
+# Windows runners) and uploads it as a downloadable artifact — so you can get
+# the .exe without owning/using a Windows PC.
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  push:
+    paths: ['agent/**']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build winMon.exe
+        working-directory: agent
+        run: >
+          pyinstaller --noconsole --onefile --name winMon
+          --hidden-import win32gui --hidden-import win32process --hidden-import win32api
+          --hidden-import win32file --hidden-import win32print --hidden-import winreg
+          --hidden-import psutil --hidden-import uiautomation
+          --hidden-import PIL.ImageGrab --hidden-import pynput.keyboard --hidden-import pynput.mouse
+          agent.py
+
+      - name: Upload winMon.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: winMon-exe
+          path: agent/dist/winMon.exe
+          if-no-files-found: error

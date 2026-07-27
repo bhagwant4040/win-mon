@@ -1,0 +1,6 @@
+agent/venv/
+agent/build/
+agent/dist/
+agent/*.spec
+__pycache__/
+*.pyc

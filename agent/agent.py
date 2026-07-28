@@ -368,8 +368,13 @@ def setup_dialog(cfg):
     e_srv = tk.Entry(frm, width=30); e_srv.grid(row=0, column=1, pady=5); e_srv.insert(0, server)
     tk.Label(frm, text='Office / Location').grid(row=1, column=0, sticky='w', pady=5)
     off_var = tk.StringVar()
-    cb = ttk.Combobox(frm, width=27, textvariable=off_var, values=offices)
+    # Choose from the office list set in EMS. Only allow free typing if the
+    # server returned no offices (so setup never gets blocked).
+    cb = ttk.Combobox(frm, width=27, textvariable=off_var, values=offices,
+                      state=('readonly' if offices else 'normal'))
     cb.grid(row=1, column=1, pady=5)
+    if offices:
+        cb.set('— choose office —')
     tk.Label(frm, text='Name (this PC)').grid(row=2, column=0, sticky='w', pady=5)
     e_name = tk.Entry(frm, width=30); e_name.grid(row=2, column=1, pady=5)
 
@@ -380,8 +385,12 @@ def setup_dialog(cfg):
         srv = e_srv.get().strip().rstrip('/') or DEFAULT_SERVER
         office = off_var.get().strip()
         name = e_name.get().strip()
-        if not office or not name:
-            status.config(text='Enter the office/location and a name for this PC.'); return
+        if office.startswith('—'):
+            office = ''
+        if not office:
+            status.config(text='Choose the office/location for this PC.'); return
+        if not name:
+            status.config(text='Enter a name for this PC.'); return
         try:
             r = requests.post(srv + '/api/win/register', json={
                 'agent_id': agent_id, 'office': office, 'name': name,

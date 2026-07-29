@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.3'
+APP_VERSION = '1.4'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -552,19 +552,35 @@ def show_status_dialog(cfg):
     except Exception:
         status_txt, color = 'Cannot reach server — check network', '#dc2626'
 
-    root = tk.Tk(); root.title('winMon — This PC'); root.geometry('440x250'); root.resizable(False, False)
-    tk.Label(root, text='Computer Monitoring', font=('Segoe UI', 13, 'bold')).pack(pady=(18, 2))
+    root = tk.Tk(); root.title('winMon — This PC'); root.geometry('440x300'); root.resizable(False, False)
+    tk.Label(root, text='Computer Monitoring', font=('Segoe UI', 13, 'bold')).pack(pady=(16, 2))
     tk.Label(root, text=(cfg.get('name') or '') + ('  ·  ' + cfg.get('office') if cfg.get('office') else ''),
              fg='#333', font=('Segoe UI', 10)).pack()
-    tk.Label(root, text='Unique ID', fg='#666', font=('Segoe UI', 9)).pack(pady=(14, 0))
+    tk.Label(root, text='Unique ID', fg='#666', font=('Segoe UI', 9)).pack(pady=(12, 0))
     idbox = tk.Entry(root, width=42, font=('Consolas', 10), justify='center', bd=1, relief='solid')
     idbox.pack(pady=2); idbox.insert(0, agent_id); idbox.config(state='readonly')
 
     def copyid():
         root.clipboard_clear(); root.clipboard_append(agent_id)
     tk.Button(root, text='Copy ID', command=copyid, width=12).pack(pady=6)
-    tk.Label(root, text=status_txt, fg=color, font=('Segoe UI', 10, 'bold'), wraplength=400).pack(pady=8)
-    tk.Button(root, text='Close', command=root.destroy, width=12).pack(pady=4)
+    tk.Label(root, text=status_txt, fg=color, font=('Segoe UI', 10, 'bold'), wraplength=400).pack(pady=6)
+
+    # Current version + live update status
+    ver_lbl = tk.Label(root, text='Version %s · checking for updates…' % APP_VERSION,
+                       fg='#666', font=('Segoe UI', 9))
+    ver_lbl.pack(pady=(2, 0))
+
+    def _upd_check():
+        upd = _check_update()
+        txt = ('Version %s · update available (v%s) — installs automatically'
+               % (APP_VERSION, upd[0])) if upd else ('Version %s · up to date' % APP_VERSION)
+        try:
+            root.after(0, lambda: ver_lbl.config(text=txt))
+        except Exception:
+            pass
+    threading.Thread(target=_upd_check, daemon=True).start()
+
+    tk.Button(root, text='Close', command=root.destroy, width=12).pack(pady=8)
     root.mainloop()
 
 

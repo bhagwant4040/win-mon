@@ -18,11 +18,16 @@ import uuid
 import socket
 import getpass
 import threading
+import subprocess
 
 import requests
 
-APP_VERSION = '1.1'
+APP_VERSION = '1.2'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
+
+# Self-update: the exe is published as a GitHub Release; the agent checks the
+# latest release and replaces itself when a newer version is available.
+UPDATE_REPO = 'bhagwant4040/win-mon'
 
 # Config lives in %APPDATA%\winMon so it's writable even when the .exe is in
 # Program Files. Holds server url, agent_id (persistent), employee_id, token.
@@ -63,6 +68,76 @@ def _register(cfg):
         return r.ok
     except Exception:
         return False
+
+
+# ── Self-update (silent, from GitHub Releases) ────────────────────────────────
+def _ver_tuple(v):
+    out = []
+    for p in str(v).lstrip('vV').split('.'):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def _check_update():
+    """Return (version, download_url) if a newer release exists, else None."""
+    try:
+        r = requests.get('https://api.github.com/repos/%s/releases/latest' % UPDATE_REPO,
+                         headers={'Accept': 'application/vnd.github+json'}, timeout=15)
+        if not r.ok:
+            return None
+        d = r.json()
+        tag = (d.get('tag_name') or '').lstrip('vV')
+        if not tag or _ver_tuple(tag) <= _ver_tuple(APP_VERSION):
+            return None
+        url = None
+        for a in (d.get('assets') or []):
+            if (a.get('name') or '').lower().endswith('.exe'):
+                url = a.get('browser_download_url'); break
+        if not url:
+            url = 'https://github.com/%s/releases/latest/download/winMon.exe' % UPDATE_REPO
+        return (tag, url)
+    except Exception:
+        return None
+
+
+def _apply_update(url):
+    """Download the new exe and relaunch via a tiny updater batch. Windows only.
+    A running exe can't overwrite itself, so we exit and let the batch swap it."""
+    if not getattr(sys, 'frozen', False):
+        return False  # only update the packaged .exe, not a python/dev run
+    exe = sys.executable
+    newexe = exe + '.new'
+    try:
+        with requests.get(url, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            with open(newexe, 'wb') as f:
+                for chunk in r.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+        if os.path.getsize(newexe) < 1_000_000:   # sanity: a real exe is several MB
+            os.remove(newexe); return False
+    except Exception:
+        try: os.remove(newexe)
+        except OSError: pass
+        return False
+    pid = os.getpid()
+    bat = os.path.join(_CFG_DIR, 'winmon-update.bat')
+    try:
+        with open(bat, 'w') as f:
+            f.write('@echo off\r\n')
+            f.write(':wait\r\n')
+            f.write('timeout /t 2 /nobreak >nul\r\n')
+            f.write('tasklist /fi "PID eq %d" | find "%d" >nul && goto wait\r\n' % (pid, pid))
+            f.write('move /y "%s" "%s" >nul\r\n' % (newexe, exe))
+            f.write('start "" "%s"\r\n' % exe)
+            f.write('del "%%~f0"\r\n')
+        subprocess.Popen(['cmd', '/c', bat], creationflags=0x00000008, close_fds=True)  # DETACHED
+    except Exception:
+        return False
+    os._exit(0)   # release the exe so the batch can replace it, then relaunch
 
 
 # ── Windows foreground / idle / browser-url helpers ───────────────────────────
@@ -540,6 +615,12 @@ class Tracker:
         except Exception:
             pass
 
+    def maybe_update(self):
+        """Check for a newer released exe and self-update silently if found."""
+        upd = _check_update()
+        if upd:
+            _apply_update(upd[1])   # exits & relaunches the new version if it succeeds
+
     def check_pending(self):
         """Heartbeat + honour an admin's on-demand screenshot request immediately."""
         try:
@@ -762,12 +843,14 @@ class Tracker:
                 self.queue = batch + self.queue
 
     def run(self):
+        self.maybe_update()       # self-update on startup if a newer exe is out
         self.fetch_config()
         self.fetch_policy()
         self.send_health()
         self.run_detectors()      # establish baselines (no events on first pass)
         self.scan_software()
         last_upload = last_health = last_shot = last_sw = last_pcheck = time.time()
+        last_upd = time.time()
         while self.token:
             try:
                 self.sample()
@@ -790,6 +873,9 @@ class Tracker:
                 if now - last_health >= self.health_int:
                     self.send_health()
                     last_health = now
+                if now - last_upd >= 6 * 3600:        # check for a new exe every 6h
+                    self.maybe_update()
+                    last_upd = now
             except Exception as ex:
                 self.report_error('%s: %s' % (type(ex).__name__, ex))
             time.sleep(self.sample_int)

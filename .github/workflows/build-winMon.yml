@@ -9,6 +9,9 @@ on:
   push:
     paths: ['agent/**']
 
+permissions:
+  contents: write            # needed to publish the release for auto-update
+
 jobs:
   build:
     runs-on: windows-latest
@@ -35,9 +38,25 @@ jobs:
           --hidden-import PIL.ImageGrab --hidden-import pynput.keyboard --hidden-import pynput.mouse
           agent.py
 
-      - name: Upload winMon.exe
+      - name: Upload winMon.exe (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: winMon-exe
           path: agent/dist/winMon.exe
           if-no-files-found: error
+
+      # Publish a GitHub Release tagged with the agent's APP_VERSION and attach
+      # winMon.exe. Installed agents check the "latest" release and self-update.
+      - name: Publish release for auto-update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oE "APP_VERSION = '[^']+'" agent/agent.py | head -1 | cut -d"'" -f2)
+          echo "version=$VER"
+          if gh release view "v$VER" >/dev/null 2>&1; then
+            gh release upload "v$VER" agent/dist/winMon.exe --clobber
+          else
+            gh release create "v$VER" agent/dist/winMon.exe \
+              --title "winMon v$VER" --notes "Automated build — agents auto-update to this version."
+          fi

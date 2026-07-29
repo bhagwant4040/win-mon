@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.2'
+APP_VERSION = '1.3'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -68,6 +68,27 @@ def _register(cfg):
         return r.ok
     except Exception:
         return False
+
+
+# ── Remote commands (lock / logoff / restart / shutdown) ──────────────────────
+def _run_remote_command(cmd):
+    """Execute an admin remote command on this PC. Windows only."""
+    try:
+        flags = 0x08000000 if os.name == 'nt' else 0   # CREATE_NO_WINDOW
+        if cmd == 'lock':
+            try:
+                import ctypes
+                ctypes.windll.user32.LockWorkStation()
+            except Exception:
+                subprocess.Popen(['rundll32.exe', 'user32.dll,LockWorkStation'], creationflags=flags)
+        elif cmd == 'logoff':
+            subprocess.Popen(['shutdown', '/l'], creationflags=flags)
+        elif cmd == 'restart':
+            subprocess.Popen(['shutdown', '/r', '/t', '0', '/f'], creationflags=flags)
+        elif cmd == 'shutdown':
+            subprocess.Popen(['shutdown', '/s', '/t', '0', '/f'], creationflags=flags)
+    except Exception:
+        pass
 
 
 # ── Self-update (silent, from GitHub Releases) ────────────────────────────────
@@ -622,12 +643,18 @@ class Tracker:
             _apply_update(upd[1])   # exits & relaunches the new version if it succeeds
 
     def check_pending(self):
-        """Heartbeat + honour an admin's on-demand screenshot request immediately."""
+        """Heartbeat + honour admin requests: on-demand screenshot and remote
+        commands (lock / logoff / restart / shutdown)."""
         try:
             r = requests.post(self.server + '/api/win/heartbeat',
                               headers=self._headers(), timeout=10)
-            if r.ok and (r.json() or {}).get('shot_now'):
+            if not r.ok:
+                return
+            d = r.json() or {}
+            if d.get('shot_now'):
                 self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
+            if d.get('cmd'):
+                _run_remote_command(d.get('cmd'))
         except Exception:
             pass
 

@@ -21,7 +21,7 @@ import threading
 
 import requests
 
-APP_VERSION = '1.0'
+APP_VERSION = '1.1'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Config lives in %APPDATA%\winMon so it's writable even when the .exe is in
@@ -39,9 +39,30 @@ def load_cfg():
 
 
 def save_cfg(cfg):
+    """Write config atomically so a crash mid-write can't corrupt/erase it."""
     os.makedirs(_CFG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+    tmp = CONFIG_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cfg, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_PATH)
+
+
+def _register(cfg):
+    """Silently (re)register this PC with its saved office/name/agent_id — no dialog.
+    Used on first setup and whenever the server has lost our record. Returns True on ok."""
+    server = (cfg.get('server') or DEFAULT_SERVER).rstrip('/')
+    try:
+        r = requests.post(server + '/api/win/register', json={
+            'agent_id': _agent_id(cfg),
+            'office': cfg.get('office', ''), 'name': cfg.get('name', ''),
+            'hostname': socket.gethostname(), 'os_user': getpass.getuser(),
+            'app_version': APP_VERSION,
+        }, timeout=15)
+        return r.ok
+    except Exception:
+        return False
 
 
 # ── Windows foreground / idle / browser-url helpers ───────────────────────────
@@ -520,7 +541,10 @@ class Tracker:
             pass
 
     def wait_for_approval(self):
-        """Poll /session until the admin approves; returns the token."""
+        """Poll /session until the admin approves. Returns the token when active,
+        or None only when the admin explicitly denied/revoked this PC. If the
+        server has no record of us ('none'), silently re-register and keep waiting
+        — we never pop the setup dialog again once the PC has been configured."""
         while True:
             try:
                 r = requests.get(self.server + '/api/win/session',
@@ -531,10 +555,11 @@ class Tracker:
                     if st == 'active' and d.get('token'):
                         self.token = d['token']
                         self.cfg['token'] = self.token; save_cfg(self.cfg)
-                        return
-                    if st in ('denied', 'revoked', 'none'):
-                        # need to (re-)enroll
-                        return None
+                        return self.token
+                    if st in ('denied', 'revoked'):
+                        return None            # admin removed this PC
+                    if st == 'none':
+                        _register(self.cfg)    # server lost us → re-register, stay pending
             except Exception:
                 pass
             time.sleep(20)
@@ -791,16 +816,17 @@ def main():
         show_status_dialog(cfg)
         return
 
-    # We are the monitor process.
+    # We are the monitor process. Runs forever; only the admin can stop it (revoke).
     while True:
         t = Tracker(cfg)
         if not t.token:
-            res = t.wait_for_approval()
-            if res is None:
-                # denied/revoked → ask the user to re-register (office/name)
+            tok = t.wait_for_approval()
+            if tok is None:
+                # Admin denied/revoked this PC. Stop monitoring, but keep polling
+                # quietly so it resumes automatically if re-approved. NEVER pop the
+                # setup dialog — only the admin controls registration.
                 cfg['token'] = None; save_cfg(cfg)
-                if not setup_dialog(cfg):
-                    return
+                time.sleep(60)
                 cfg = load_cfg()
                 continue
             cfg = load_cfg(); t.token = cfg.get('token')
@@ -811,7 +837,7 @@ def main():
                 t.report_error('fatal: %s' % ex)
             except Exception:
                 pass
-        # token dropped (revoked) → loop back and wait for re-approval
+        # token dropped (revoked mid-run) → loop back and wait for re-approval
         cfg = load_cfg()
         time.sleep(5)
 

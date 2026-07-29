@@ -540,6 +540,16 @@ class Tracker:
         except Exception:
             pass
 
+    def check_pending(self):
+        """Heartbeat + honour an admin's on-demand screenshot request immediately."""
+        try:
+            r = requests.post(self.server + '/api/win/heartbeat',
+                              headers=self._headers(), timeout=10)
+            if r.ok and (r.json() or {}).get('shot_now'):
+                self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
+        except Exception:
+            pass
+
     def wait_for_approval(self):
         """Poll /session until the admin approves. Returns the token when active,
         or None only when the admin explicitly denied/revoked this PC. If the
@@ -757,12 +767,15 @@ class Tracker:
         self.send_health()
         self.run_detectors()      # establish baselines (no events on first pass)
         self.scan_software()
-        last_upload = last_health = last_shot = last_sw = time.time()
+        last_upload = last_health = last_shot = last_sw = last_pcheck = time.time()
         while self.token:
             try:
                 self.sample()
                 now = time.time()
                 self.run_detectors()   # cheap: USB + print each sample
+                if now - last_pcheck >= 15:   # on-demand screenshot request?
+                    self.check_pending()
+                    last_pcheck = now
                 if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
                     self.capture_screenshot()
                     last_shot = now

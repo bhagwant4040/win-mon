@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '2.0'
+APP_VERSION = '2.1'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -652,6 +652,7 @@ class Tracker:
         self._drives = None        # detector baselines
         self._installed = None
         self._pjobs = None
+        self._live_until = 0       # stream live frames while > time.time()
 
     def _headers(self):
         return {'Authorization': 'Bearer ' + self.token} if self.token else {}
@@ -709,6 +710,8 @@ class Tracker:
             d = r.json() or {}
             if d.get('shot_now'):
                 self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
+            if d.get('live'):
+                self._live_until = time.time() + 20   # keep streaming until re-confirmed
             cmd = d.get('cmd')
             if cmd == 'update':
                 self.maybe_update()         # force an update check now (exits if updating)
@@ -853,6 +856,17 @@ class Tracker:
         except Exception as ex:
             self.report_error('screenshot upload error: %s' % ex)
 
+    def send_live_frame(self):
+        """Upload one live-view frame (smaller/faster than a saved screenshot)."""
+        buf = capture_jpeg(max_w=1100, quality=42)
+        if not buf:
+            return
+        try:
+            requests.post(self.server + '/api/win/live', headers=self._headers(),
+                          files={'image': ('live.jpg', buf, 'image/jpeg')}, timeout=10)
+        except Exception:
+            pass
+
     def _flush_events(self):
         if not self.event_queue:
             return
@@ -946,9 +960,15 @@ class Tracker:
                 self.sample()
                 now = time.time()
                 self.run_detectors()   # cheap: USB + print each sample
-                if now - last_pcheck >= 15:   # on-demand screenshot request?
+                # Poll for admin requests (screenshot / command / live). Poll faster
+                # while a Live View is active so it feels responsive.
+                live = now < self._live_until
+                if now - last_pcheck >= (5 if live else 10):
                     self.check_pending()
                     last_pcheck = now
+                    live = now < self._live_until
+                if live:
+                    self.send_live_frame()
                 if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
                     self.capture_screenshot()
                     last_shot = now
@@ -968,7 +988,7 @@ class Tracker:
                     last_upd = now
             except Exception as ex:
                 self.report_error('%s: %s' % (type(ex).__name__, ex))
-            time.sleep(self.sample_int)
+            time.sleep(1.5 if time.time() < self._live_until else self.sample_int)
 
 
 def _acquire_single_instance(retries=1):

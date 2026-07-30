@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.5'
+APP_VERSION = '1.6'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -698,8 +698,11 @@ class Tracker:
             d = r.json() or {}
             if d.get('shot_now'):
                 self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
-            if d.get('cmd'):
-                _run_remote_command(d.get('cmd'))
+            cmd = d.get('cmd')
+            if cmd == 'update':
+                self.maybe_update()         # force an update check now (exits if updating)
+            elif cmd:
+                _run_remote_command(cmd)
         except Exception:
             pass
 

@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.6'
+APP_VERSION = '1.7'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -125,12 +125,16 @@ def _check_update():
 
 
 def _apply_update(url):
-    """Download the new exe and relaunch via a tiny updater batch. Windows only.
-    A running exe can't overwrite itself, so we exit and let the batch swap it."""
+    """Download and install the new exe, then relaunch it. Windows only.
+    Uses the rename trick: a running .exe can be RENAMED (not overwritten) while
+    running, so we move ourselves aside and drop the new exe into place — no batch
+    file, no console window, no waiting/retry loop."""
     if not getattr(sys, 'frozen', False):
         return False  # only update the packaged .exe, not a python/dev run
     exe = sys.executable
     newexe = exe + '.new'
+    oldexe = exe + '.old'
+    # 1) download the new exe alongside the current one
     try:
         with requests.get(url, stream=True, timeout=180) as r:
             r.raise_for_status()
@@ -144,50 +148,41 @@ def _apply_update(url):
         try: os.remove(newexe)
         except OSError: pass
         return False
-    pid = os.getpid()
-    bat = os.path.join(_CFG_DIR, 'winmon-update.bat')
+    # 2) swap by renaming (allowed while the exe is running)
     try:
-        lines = [
-            '@echo off',
-            'set "EXE=%s"' % exe,
-            'set "NEW=%s"' % newexe,
-            'set /a n=0',
-            # 1) wait for THIS process to fully exit (uses ping, not timeout, which
-            #    fails when the batch has no console window)
-            ':wait',
-            'ping -n 3 127.0.0.1 >nul',
-            'tasklist /fi "PID eq %d" | find "%d" >nul && goto wait' % (pid, pid),
-            # 2) swap the exe, retrying — the file may stay locked briefly after exit
-            #    (Windows / antivirus scan). Keep trying until it succeeds.
-            ':swap',
-            'move /y "%NEW%" "%EXE%" >nul 2>&1',
-            'if not exist "%NEW%" goto done',
-            'set /a n+=1',
-            'if %n% geq 40 goto done',
-            'ping -n 3 127.0.0.1 >nul',
-            'goto swap',
-            ':done',
-            'start "" "%EXE%"',
-            'del "%~f0"',
-        ]
-        with open(bat, 'w') as f:
-            f.write('\r\n'.join(lines) + '\r\n')
-        subprocess.Popen(['cmd', '/c', bat], creationflags=0x08000000, close_fds=True)  # CREATE_NO_WINDOW
-    except Exception:
+        if os.path.exists(oldexe):
+            try: os.remove(oldexe)
+            except OSError: pass
+        os.rename(exe, oldexe)     # move the running exe aside
+        os.rename(newexe, exe)     # install the new exe under the real name
+    except OSError:
+        try:                       # roll back if we moved ourselves but couldn't install
+            if not os.path.exists(exe) and os.path.exists(oldexe):
+                os.rename(oldexe, exe)
+        except OSError: pass
+        try:
+            if os.path.exists(newexe): os.remove(newexe)
+        except OSError: pass
         return False
-    os._exit(0)   # release the exe so the batch can replace it, then relaunch
+    # 3) launch the freshly installed exe (detached, windowless) and exit
+    try:
+        subprocess.Popen([exe, '--relaunch'], creationflags=0x00000008, close_fds=True)  # DETACHED
+    except Exception:
+        pass
+    os._exit(0)
 
 
 def _cleanup_stale_update():
-    """Remove a leftover winMon.exe.new from an interrupted update (Windows)."""
+    """Remove leftover .new / .old files from a previous update (Windows)."""
     if not getattr(sys, 'frozen', False):
         return
-    try:
-        stale = sys.executable + '.new'
-        if os.path.exists(stale):
-            os.remove(stale)
-    except OSError:
-        pass
+    for suffix in ('.new', '.old'):
+        try:
+            p = sys.executable + suffix
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 
 # ── Windows foreground / idle / browser-url helpers ───────────────────────────
@@ -956,25 +951,29 @@ class Tracker:
             time.sleep(self.sample_int)
 
 
-def _acquire_single_instance():
+def _acquire_single_instance(retries=1):
     """Return a bound socket if we are the first/only monitor process, else None.
-    Used so re-opening the app while it's already running just shows the status."""
+    Retries briefly (used after a self-update, to wait for the old process to
+    release the port before this fresh copy takes over)."""
     import socket as _s
-    try:
-        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
-        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 0)
-        srv.bind(('127.0.0.1', 49517))
-        srv.listen(1)
-        return srv
-    except OSError:
-        return None
+    for i in range(max(1, retries)):
+        try:
+            srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+            srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 0)
+            srv.bind(('127.0.0.1', 49517))
+            srv.listen(1)
+            return srv
+        except OSError:
+            if i < retries - 1:
+                time.sleep(1)
+    return None
 
 
 def main():
     if not _WIN:
         print('winMon runs on Windows only.')
         return
-    _cleanup_stale_update()   # clear any leftover .new from an interrupted update
+    _cleanup_stale_update()   # clear any leftover .new/.old from a previous update
     cfg = load_cfg()
     _agent_id(cfg)
 
@@ -985,9 +984,13 @@ def main():
         cfg = load_cfg()
 
     # Already registered. If a monitor is already running, this launch is the
-    # user asking "show my ID / status" → display it and exit.
-    lock = _acquire_single_instance()
+    # user asking "show my ID / status" → display it and exit. After a self-update
+    # (--relaunch) we instead wait for the old copy to release the port.
+    relaunch = '--relaunch' in sys.argv
+    lock = _acquire_single_instance(retries=(15 if relaunch else 1))
     if lock is None:
+        if relaunch:
+            return          # old copy still holding on; autostart will recover
         show_status_dialog(cfg)
         return
 

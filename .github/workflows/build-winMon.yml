@@ -35,7 +35,9 @@ jobs:
           --hidden-import win32gui --hidden-import win32process --hidden-import win32api
           --hidden-import win32file --hidden-import win32print --hidden-import winreg
           --hidden-import psutil --hidden-import uiautomation
-          --hidden-import PIL.ImageGrab --hidden-import pynput.keyboard --hidden-import pynput.mouse
+          --collect-all PIL
+          --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin
+          --hidden-import pynput.keyboard --hidden-import pynput.mouse
           agent.py
 
       - name: Upload winMon.exe (artifact)

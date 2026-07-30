@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.9'
+APP_VERSION = '2.0'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -377,20 +377,29 @@ def start_intensity():
         pass
 
 
+_shot_err = ''
+
+
 def capture_jpeg(max_w=1366, quality=55):
-    """Grab the screen → downscaled JPEG in a BytesIO buffer."""
+    """Grab the screen → downscaled JPEG in a BytesIO buffer. On failure records
+    the reason in _shot_err and returns None."""
+    global _shot_err
     try:
         from PIL import ImageGrab
         import io
-        img = ImageGrab.grab()
+        img = ImageGrab.grab(all_screens=True)
+        if img is None:
+            _shot_err = 'ImageGrab.grab() returned None'; return None
         if img.width > max_w:
             r = max_w / float(img.width)
             img = img.resize((max_w, int(img.height * r)))
         buf = io.BytesIO()
         img.convert('RGB').save(buf, 'JPEG', quality=quality)
         buf.seek(0)
+        _shot_err = ''
         return buf
-    except Exception:
+    except Exception as ex:
+        _shot_err = '%s: %s' % (type(ex).__name__, ex)
         return None
 
 
@@ -832,14 +841,17 @@ class Tracker:
     def capture_screenshot(self):
         buf = capture_jpeg()
         if not buf:
+            self.report_error('screenshot capture failed — ' + (_shot_err or 'unknown'))
             return
         app, title, _pid = get_foreground()
         try:
-            requests.post(self.server + '/api/win/screenshot', headers=self._headers(),
-                          files={'image': ('shot.jpg', buf, 'image/jpeg')},
-                          data={'app': app, 'title': title}, timeout=25)
-        except Exception:
-            pass
+            r = requests.post(self.server + '/api/win/screenshot', headers=self._headers(),
+                              files={'image': ('shot.jpg', buf, 'image/jpeg')},
+                              data={'app': app, 'title': title}, timeout=25)
+            if not r.ok and r.status_code != 401:
+                self.report_error('screenshot upload failed: HTTP %s' % r.status_code)
+        except Exception as ex:
+            self.report_error('screenshot upload error: %s' % ex)
 
     def _flush_events(self):
         if not self.event_queue:

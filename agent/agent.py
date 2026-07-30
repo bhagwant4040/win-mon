@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.8'
+APP_VERSION = '1.9'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -142,7 +142,7 @@ def _apply_update(url):
                 for chunk in r.iter_content(65536):
                     if chunk:
                         f.write(chunk)
-        if os.path.getsize(newexe) < 1_000_000:   # sanity: a real exe is several MB
+        if os.path.getsize(newexe) < 8_000_000:   # sanity: the real exe is ~15 MB
             os.remove(newexe); return False
     except Exception:
         try: os.remove(newexe)
@@ -164,9 +164,15 @@ def _apply_update(url):
             if os.path.exists(newexe): os.remove(newexe)
         except OSError: pass
         return False
-    # 3) launch the freshly installed exe (detached, windowless) and exit
+    # 3) launch the freshly installed exe (detached, windowless) and exit.
+    #    Strip PyInstaller's _MEIPASS2 / _PYI_* env vars so the child does a FRESH
+    #    onefile extraction instead of reusing our about-to-be-deleted temp dir —
+    #    otherwise the child crashes with "No module named '_socket'".
     try:
-        subprocess.Popen([exe, '--relaunch'], creationflags=0x00000008, close_fds=True)  # DETACHED
+        child_env = {k: v for k, v in os.environ.items()
+                     if not (k.startswith('_MEI') or k.startswith('_PYI'))}
+        subprocess.Popen([exe, '--relaunch'], creationflags=0x00000008,  # DETACHED
+                         close_fds=True, env=child_env)
     except Exception:
         pass
     os._exit(0)

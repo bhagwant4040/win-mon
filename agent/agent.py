@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.4'
+APP_VERSION = '1.5'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -147,18 +147,47 @@ def _apply_update(url):
     pid = os.getpid()
     bat = os.path.join(_CFG_DIR, 'winmon-update.bat')
     try:
+        lines = [
+            '@echo off',
+            'set "EXE=%s"' % exe,
+            'set "NEW=%s"' % newexe,
+            'set /a n=0',
+            # 1) wait for THIS process to fully exit (uses ping, not timeout, which
+            #    fails when the batch has no console window)
+            ':wait',
+            'ping -n 3 127.0.0.1 >nul',
+            'tasklist /fi "PID eq %d" | find "%d" >nul && goto wait' % (pid, pid),
+            # 2) swap the exe, retrying — the file may stay locked briefly after exit
+            #    (Windows / antivirus scan). Keep trying until it succeeds.
+            ':swap',
+            'move /y "%NEW%" "%EXE%" >nul 2>&1',
+            'if not exist "%NEW%" goto done',
+            'set /a n+=1',
+            'if %n% geq 40 goto done',
+            'ping -n 3 127.0.0.1 >nul',
+            'goto swap',
+            ':done',
+            'start "" "%EXE%"',
+            'del "%~f0"',
+        ]
         with open(bat, 'w') as f:
-            f.write('@echo off\r\n')
-            f.write(':wait\r\n')
-            f.write('timeout /t 2 /nobreak >nul\r\n')
-            f.write('tasklist /fi "PID eq %d" | find "%d" >nul && goto wait\r\n' % (pid, pid))
-            f.write('move /y "%s" "%s" >nul\r\n' % (newexe, exe))
-            f.write('start "" "%s"\r\n' % exe)
-            f.write('del "%%~f0"\r\n')
-        subprocess.Popen(['cmd', '/c', bat], creationflags=0x00000008, close_fds=True)  # DETACHED
+            f.write('\r\n'.join(lines) + '\r\n')
+        subprocess.Popen(['cmd', '/c', bat], creationflags=0x08000000, close_fds=True)  # CREATE_NO_WINDOW
     except Exception:
         return False
     os._exit(0)   # release the exe so the batch can replace it, then relaunch
+
+
+def _cleanup_stale_update():
+    """Remove a leftover winMon.exe.new from an interrupted update (Windows)."""
+    if not getattr(sys, 'frozen', False):
+        return
+    try:
+        stale = sys.executable + '.new'
+        if os.path.exists(stale):
+            os.remove(stale)
+    except OSError:
+        pass
 
 
 # ── Windows foreground / idle / browser-url helpers ───────────────────────────
@@ -942,6 +971,7 @@ def main():
     if not _WIN:
         print('winMon runs on Windows only.')
         return
+    _cleanup_stale_update()   # clear any leftover .new from an interrupted update
     cfg = load_cfg()
     _agent_id(cfg)
 

@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '1.7'
+APP_VERSION = '1.8'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -687,7 +687,8 @@ class Tracker:
         commands (lock / logoff / restart / shutdown)."""
         try:
             r = requests.post(self.server + '/api/win/heartbeat',
-                              headers=self._headers(), timeout=10)
+                              headers=self._headers(),
+                              json={'app_version': APP_VERSION}, timeout=10)
             if not r.ok:
                 return
             d = r.json() or {}
@@ -895,7 +896,8 @@ class Tracker:
         if not batch:
             # heartbeat so the dashboard shows the PC online even when idle
             try:
-                requests.post(self.server + '/api/win/heartbeat', headers=self._headers(), timeout=10)
+                requests.post(self.server + '/api/win/heartbeat', headers=self._headers(),
+                              json={'app_version': APP_VERSION}, timeout=10)
             except Exception:
                 pass
             return

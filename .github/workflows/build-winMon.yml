@@ -40,6 +40,7 @@ jobs:
           --hidden-import pynput.keyboard --hidden-import pynput.mouse
           --collect-all sounddevice --collect-all numpy
           --hidden-import websocket --hidden-import numpy
+          --collect-all cv2 --hidden-import cv2
           agent.py
 
       - name: Upload winMon.exe (artifact)

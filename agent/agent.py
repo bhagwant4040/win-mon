@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '2.2'
+APP_VERSION = '2.3'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -804,6 +804,8 @@ class Tracker:
         self._installed = None
         self._pjobs = None
         self._live_until = 0       # stream live frames while > time.time()
+        self._cam_until = 0        # stream the webcam (not screen) while > time.time()
+        self._cam = None           # open cv2.VideoCapture during camera mode
 
     def _headers(self):
         return {'Authorization': 'Bearer ' + self.token} if self.token else {}
@@ -863,6 +865,9 @@ class Tracker:
                 self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
             if d.get('live'):
                 self._live_until = time.time() + 20   # keep streaming until re-confirmed
+            self._cam_until = (time.time() + 20) if d.get('cam') else 0
+            if not d.get('cam'):
+                self._release_cam()               # turn the webcam (LED) back off promptly
             if d.get('talk'):
                 self._ensure_talk()
             else:
@@ -1030,8 +1035,12 @@ class Tracker:
             self.report_error('screenshot upload error: %s' % ex)
 
     def send_live_frame(self):
-        """Upload one live-view frame (smaller/faster than a saved screenshot)."""
-        buf = capture_jpeg(max_w=1100, quality=42)
+        """Upload one live-view frame — the screen, or the WEBCAM in camera mode."""
+        if time.time() < self._cam_until:
+            buf = self._webcam_frame()
+        else:
+            self._release_cam()
+            buf = capture_jpeg(max_w=1100, quality=42)
         if not buf:
             return
         try:
@@ -1039,6 +1048,30 @@ class Tracker:
                           files={'image': ('live.jpg', buf, 'image/jpeg')}, timeout=10)
         except Exception:
             pass
+
+    def _webcam_frame(self):
+        """Capture one JPEG frame from the webcam (opens the camera; LED lights)."""
+        try:
+            import cv2, io
+            if self._cam is None:
+                self._cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            ok, frame = self._cam.read()
+            if not ok or frame is None:
+                return None
+            ok2, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            if not ok2:
+                return None
+            return io.BytesIO(enc.tobytes())
+        except Exception as ex:
+            self.report_error('webcam failed: %s' % ex)
+            self._release_cam()
+            return None
+
+    def _release_cam(self):
+        if self._cam is not None:
+            try: self._cam.release()
+            except Exception: pass
+            self._cam = None
 
     def _flush_events(self):
         if not self.event_queue:

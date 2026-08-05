@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '2.1'
+APP_VERSION = '2.2'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -89,6 +89,113 @@ def _run_remote_command(cmd):
             subprocess.Popen(['shutdown', '/s', '/t', '0', '/f'], creationflags=flags)
     except Exception:
         pass
+
+
+# ── Two-way voice (admin ↔ this PC) ───────────────────────────────────────────
+_talk = {'session': None}
+
+
+def _talk_ws_url(server, token):
+    base = (server or DEFAULT_SERVER).rstrip('/')
+    if base.startswith('https://'):
+        base = 'wss://' + base[len('https://'):]
+    elif base.startswith('http://'):
+        base = 'ws://' + base[len('http://'):]
+    return base + '/talkws/talk/agent/' + token
+
+
+class TalkSession:
+    """Live 16kHz mono voice: streams the mic up and plays received audio on the
+    speaker, over a WebSocket to the relay. A small on-screen banner shows it's live."""
+    RATE = 16000
+    BLK = 1600   # 100 ms frames
+
+    def __init__(self, url):
+        self.url = url
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        self.ws = None
+        self.in_stream = None
+        self.out_stream = None
+        self.alive = False
+        self._ind = None
+
+    def start(self):
+        import sounddevice as sd
+        import numpy as np
+        import websocket
+        self._np = np
+        self.alive = True
+
+        def on_message(ws, message):
+            if isinstance(message, (bytes, bytearray)):
+                with self.lock:
+                    self.buf.extend(message)
+                    cap = self.RATE * 2 * 3          # keep at most ~3 s backlog
+                    if len(self.buf) > cap:
+                        del self.buf[:len(self.buf) - self.RATE * 2 * 2]
+
+        def on_close(ws, *a):
+            self.alive = False
+
+        self.ws = websocket.WebSocketApp(self.url, on_message=on_message, on_close=on_close)
+        threading.Thread(target=lambda: self.ws.run_forever(ping_interval=20), daemon=True).start()
+
+        def in_cb(indata, frames, tinfo, status):
+            try:
+                if self.ws and self.ws.sock and self.ws.sock.connected:
+                    self.ws.send(indata.tobytes(), websocket.ABNF.OPCODE_BINARY)
+            except Exception:
+                pass
+
+        def out_cb(outdata, frames, tinfo, status):
+            need = frames * 2
+            with self.lock:
+                take = bytes(self.buf[:need]); del self.buf[:len(take)]
+            if len(take) < need:
+                take += b'\x00' * (need - len(take))
+            outdata[:, 0] = self._np.frombuffer(take, dtype='int16')
+
+        self.in_stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype='int16',
+                                        blocksize=self.BLK, callback=in_cb)
+        self.out_stream = sd.OutputStream(samplerate=self.RATE, channels=1, dtype='int16',
+                                          blocksize=self.BLK, callback=out_cb)
+        self.in_stream.start(); self.out_stream.start()
+        threading.Thread(target=self._indicator, daemon=True).start()
+
+    def _indicator(self):
+        try:
+            import tkinter as tk
+            r = tk.Tk(); r.overrideredirect(True); r.attributes('-topmost', True)
+            try: r.attributes('-alpha', 0.92)
+            except Exception: pass
+            r.configure(bg='#dc2626')
+            tk.Label(r, text='\U0001F3A4  Live audio with admin', bg='#dc2626', fg='white',
+                     font=('Segoe UI', 10, 'bold'), padx=14, pady=6).pack()
+            r.update_idletasks()
+            r.geometry('+%d+%d' % (r.winfo_screenwidth() - r.winfo_width() - 20, 20))
+            self._ind = r
+
+            def poll():
+                if not self.alive:
+                    try: r.destroy()
+                    except Exception: pass
+                    return
+                r.after(400, poll)
+            poll(); r.mainloop()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.alive = False
+        for s in (self.in_stream, self.out_stream):
+            try: s.stop(); s.close()
+            except Exception: pass
+        try: self.ws.close()
+        except Exception: pass
+        try:
+            if self._ind: self._ind.after(0, self._ind.destroy)
+        except Exception: pass
 
 
 # ── Self-update (silent, from GitHub Releases) ────────────────────────────────
@@ -288,7 +395,7 @@ def collect_health():
         except Exception:
             bat = None
         net = psutil.net_io_counters()
-        return {
+        snap = {
             'cpu_pct': psutil.cpu_percent(interval=None),
             'mem_pct': vm.percent, 'mem_total_mb': int(vm.total / 1048576),
             'disk_pct': du.percent, 'disk_free_gb': round(du.free / 1073741824, 1),
@@ -300,8 +407,41 @@ def collect_health():
             'net_sent_mb': round(net.bytes_sent / 1048576, 1),
             'net_recv_mb': round(net.bytes_recv / 1048576, 1),
         }
+        snap.update(_device_caps())
+        return snap
     except Exception:
         return {}
+
+
+_caps_cache = None
+
+
+def _device_caps():
+    """Detect presence of microphone / speaker / camera (cached). Camera check
+    uses Windows PnP so the webcam is never opened (no LED)."""
+    global _caps_cache
+    if _caps_cache is not None:
+        return _caps_cache
+    caps = {'has_mic': None, 'has_speaker': None, 'has_camera': None}
+    try:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        caps['has_mic'] = bool(any(d.get('max_input_channels', 0) > 0 for d in devs))
+        caps['has_speaker'] = bool(any(d.get('max_output_channels', 0) > 0 for d in devs))
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "@(Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Camera' OR PNPClass='Image'\").Count"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=(0x08000000 if os.name == 'nt' else 0))
+        n = (out.stdout or '').strip()
+        caps['has_camera'] = bool(n.isdigit() and int(n) > 0)
+    except Exception:
+        pass
+    _caps_cache = caps
+    return caps
 
 
 def get_idle_seconds():
@@ -514,7 +654,7 @@ def setup_dialog(cfg):
 
     root = tk.Tk()
     root.title('winMon Setup — Rajiv Syndicate')
-    root.geometry('420x330'); root.resizable(False, False)
+    root.geometry('440x440'); root.resizable(False, False)
 
     tk.Label(root, text='Computer Monitoring — Setup', font=('Segoe UI', 13, 'bold')).pack(pady=(16, 2))
     tk.Label(root, text='This PC will be registered for monitoring.', fg='#666').pack()
@@ -535,7 +675,16 @@ def setup_dialog(cfg):
     e_name = tk.Entry(frm, width=30); e_name.grid(row=2, column=1, pady=5)
 
     tk.Label(root, text='Unique ID: ' + agent_id, font=('Consolas', 9), fg='#2563eb').pack()
-    status = tk.Label(root, text='', fg='#c00', wraplength=380); status.pack()
+
+    # Consent — must be ticked to register (recorded on the server with a timestamp).
+    consent_var = tk.BooleanVar(value=False)
+    cframe = tk.Frame(root, bd=1, relief='solid'); cframe.pack(fill='x', padx=22, pady=(10, 2))
+    tk.Checkbutton(cframe, variable=consent_var, justify='left', anchor='w', wraplength=380,
+                   font=('Segoe UI', 9), padx=6, pady=6,
+                   text=('I consent to monitoring of this company PC — screen, activity, and '
+                         '(when enabled by the administrator) camera and microphone.')).pack(anchor='w')
+
+    status = tk.Label(root, text='', fg='#c00', wraplength=390); status.pack()
 
     def submit():
         srv = e_srv.get().strip().rstrip('/') or DEFAULT_SERVER
@@ -547,11 +696,13 @@ def setup_dialog(cfg):
             status.config(text='Choose the office/location for this PC.'); return
         if not name:
             status.config(text='Enter a name for this PC.'); return
+        if not consent_var.get():
+            status.config(text='Please tick the consent box to continue.'); return
         try:
             r = requests.post(srv + '/api/win/register', json={
                 'agent_id': agent_id, 'office': office, 'name': name,
                 'hostname': socket.gethostname(), 'os_user': getpass.getuser(),
-                'app_version': APP_VERSION,
+                'app_version': APP_VERSION, 'consent': True,
             }, timeout=15)
             if not r.ok:
                 status.config(text='Registration failed (%s).' % r.status_code); return
@@ -712,6 +863,10 @@ class Tracker:
                 self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
             if d.get('live'):
                 self._live_until = time.time() + 20   # keep streaming until re-confirmed
+            if d.get('talk'):
+                self._ensure_talk()
+            else:
+                self._stop_talk()
             cmd = d.get('cmd')
             if cmd == 'update':
                 self.maybe_update()         # force an update check now (exits if updating)
@@ -719,6 +874,24 @@ class Tracker:
                 _run_remote_command(cmd)
         except Exception:
             pass
+
+    def _ensure_talk(self):
+        if _talk['session'] and _talk['session'].alive:
+            return
+        try:
+            s = TalkSession(_talk_ws_url(self.server, self.token))
+            s.start()
+            _talk['session'] = s
+            self.event_queue.append({'type': 'voice', 'detail': 'Voice session started with admin',
+                                     'ts': time.time()})
+        except Exception as ex:
+            self.report_error('voice start failed: %s' % ex)
+
+    def _stop_talk(self):
+        if _talk['session']:
+            try: _talk['session'].stop()
+            except Exception: pass
+            _talk['session'] = None
 
     def wait_for_approval(self):
         """Poll /session until the admin approves. Returns the token when active,

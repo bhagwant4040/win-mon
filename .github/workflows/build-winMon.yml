@@ -38,6 +38,8 @@ jobs:
           --collect-all PIL
           --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin
           --hidden-import pynput.keyboard --hidden-import pynput.mouse
+          --collect-all sounddevice --collect-all numpy
+          --hidden-import websocket --hidden-import numpy
           agent.py
 
       - name: Upload winMon.exe (artifact)

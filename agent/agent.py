@@ -19,10 +19,11 @@ import socket
 import getpass
 import threading
 import subprocess
+import queue as _queue
 
 import requests
 
-APP_VERSION = '2.4'
+APP_VERSION = '2.5'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -285,6 +286,187 @@ class TalkSession:
         try:
             if self._ind: self._ind.after(0, self._ind.destroy)
         except Exception: pass
+
+
+# ── Admin chat + notices (on-screen, Windows) ─────────────────────────────────
+class ChatUI:
+    """PC-side windows for admin chat and notices. Runs one Tk root in its own
+    thread; the heartbeat thread feeds messages/notices via a thread-safe queue.
+
+    Chat: a window that stays on top until the user replies. Notices: a window
+    per notice that can't be closed until the user clicks 'I have read this'."""
+    def __init__(self, server, token):
+        self.server = server
+        self.token = token
+        self.q = _queue.Queue()
+        self.root = None
+        self._tk = None
+        self.txt = None
+        self.entry = None
+        self._chat_ids = set()      # admin message ids already shown
+        self._pending = 0           # unreplied admin messages → keep chat on top
+        self._notice_wins = {}      # notice_id -> Toplevel
+        self._shown_notices = set()
+        self._started = False
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        threading.Thread(target=self._ui_thread, daemon=True).start()
+
+    def feed(self, chat, notices):
+        """Called from the heartbeat thread — never touches widgets directly."""
+        self.q.put((chat or [], notices or []))
+
+    def _headers(self):
+        return {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'}
+
+    def _ui_thread(self):
+        try:
+            import tkinter as tk
+            self._tk = tk
+            self.root = tk.Tk()
+            self.root.withdraw()          # hidden until there's something to show
+            self._build_chat()
+            self.root.after(300, self._drain)
+            self.root.mainloop()
+        except Exception:
+            pass
+
+    def _build_chat(self):
+        tk = self._tk
+        w = self.root
+        w.title('Message from Admin')
+        w.configure(bg='#0f172a')
+        w.geometry('380x460')
+        tk.Label(w, text='  Admin Chat', bg='#0088FF', fg='white', anchor='w',
+                 font=('Segoe UI', 11, 'bold'), pady=6).pack(fill='x')
+        self.txt = tk.Text(w, wrap='word', state='disabled', bg='#f6f8fb', fg='#111',
+                           font=('Segoe UI', 10), bd=0, padx=10, pady=10)
+        self.txt.tag_configure('admin_h', foreground='#0088FF', font=('Segoe UI', 10, 'bold'))
+        self.txt.tag_configure('me_h', foreground='#16a34a', font=('Segoe UI', 10, 'bold'))
+        self.txt.pack(fill='both', expand=True)
+        bar = tk.Frame(w, bg='#0f172a'); bar.pack(fill='x')
+        self.entry = tk.Entry(bar, font=('Segoe UI', 10))
+        self.entry.pack(side='left', fill='x', expand=True, padx=6, pady=6)
+        self.entry.bind('<Return>', lambda e: self._send())
+        tk.Button(bar, text='Send', command=self._send, bg='#0088FF', fg='white', bd=0,
+                  activebackground='#0069cc', font=('Segoe UI', 10, 'bold'), padx=14).pack(side='right', padx=6, pady=6)
+        w.protocol('WM_DELETE_WINDOW', self._hide_chat)
+
+    def _hide_chat(self):
+        if self._pending > 0:
+            self._raise_chat()            # must reply first — force it back
+        else:
+            try: self.root.withdraw()
+            except Exception: pass
+
+    def _raise_chat(self):
+        try:
+            self.root.deiconify(); self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.entry.focus_force()
+        except Exception:
+            pass
+
+    def _append(self, who, body):
+        try:
+            self.txt.configure(state='normal')
+            self.txt.insert('end', 'Admin: ' if who == 'admin' else 'You: ',
+                            ('admin_h',) if who == 'admin' else ('me_h',))
+            self.txt.insert('end', (body or '') + '\n\n')
+            self.txt.configure(state='disabled'); self.txt.see('end')
+        except Exception:
+            pass
+
+    def _send(self):
+        try:
+            body = self.entry.get().strip()
+        except Exception:
+            return
+        if not body:
+            return
+        self.entry.delete(0, 'end')
+        self._append('me', body)
+        self._pending = 0                 # replying releases the on-top hold
+        threading.Thread(target=self._post_reply, args=(body,), daemon=True).start()
+
+    def _post_reply(self, body):
+        try:
+            requests.post(self.server + '/api/win/chat', headers=self._headers(),
+                          json={'body': body}, timeout=10)
+        except Exception:
+            pass
+
+    def _drain(self):
+        try:
+            while True:
+                chat, notices = self.q.get_nowait()
+                self._on_chat(chat)
+                self._on_notices(notices)
+        except _queue.Empty:
+            pass
+        except Exception:
+            pass
+        if self._pending > 0:
+            self._raise_chat()
+        try:
+            self.root.after(1000, self._drain)
+        except Exception:
+            pass
+
+    def _on_chat(self, chat):
+        new = [m for m in chat if m.get('id') not in self._chat_ids]
+        for m in new:
+            self._chat_ids.add(m.get('id'))
+            self._append('admin', m.get('body', ''))
+        self._pending = len(chat)         # server keeps returning until user replies
+        if new:
+            self._raise_chat()
+
+    def _on_notices(self, notices):
+        for n in notices:
+            nid = n.get('id')
+            if nid in self._shown_notices:
+                continue
+            self._shown_notices.add(nid)
+            self._show_notice(n)
+
+    def _show_notice(self, n):
+        tk = self._tk
+        try:
+            top = tk.Toplevel(self.root)
+        except Exception:
+            return
+        nid = n.get('id')
+        top.title('Notice')
+        top.configure(bg='#ffffff'); top.geometry('440x320')
+        top.attributes('-topmost', True)
+        tk.Label(top, text=n.get('title', 'Notice'), bg='#dc2626', fg='white', anchor='w',
+                 font=('Segoe UI', 12, 'bold'), padx=14, pady=9).pack(fill='x')
+        body = tk.Text(top, wrap='word', font=('Segoe UI', 11), bd=0, padx=14, pady=14)
+        body.insert('1.0', n.get('body', '')); body.configure(state='disabled')
+        body.pack(fill='both', expand=True)
+
+        def ack():
+            threading.Thread(target=self._post_ack, args=(nid,), daemon=True).start()
+            self._notice_wins.pop(nid, None)
+            try: top.destroy()
+            except Exception: pass
+
+        tk.Button(top, text='I have read this', command=ack, bg='#12b34a', fg='white', bd=0,
+                  activebackground='#0f9a40', font=('Segoe UI', 11, 'bold'), pady=9).pack(fill='x', side='bottom')
+        # can't dismiss without acknowledging
+        top.protocol('WM_DELETE_WINDOW', lambda: (top.lift(), top.attributes('-topmost', True)))
+        self._notice_wins[nid] = top
+
+    def _post_ack(self, nid):
+        try:
+            requests.post(self.server + '/api/win/notice-ack', headers=self._headers(),
+                          json={'notice_id': nid}, timeout=10)
+        except Exception:
+            pass
 
 
 # ── Self-update (silent, from GitHub Releases) ────────────────────────────────
@@ -885,6 +1067,7 @@ class Tracker:
         self.allow_only_sites = False
         self.viol_queue = []
         self.event_queue = []
+        self.chat_ui = None        # ChatUI (admin chat + notices), created lazily
         self._hosts_sig = None     # last applied hosts set (avoid rewriting each cycle)
         self.screenshots_enabled = False
         self.shot_int = 300
@@ -966,6 +1149,15 @@ class Tracker:
                 self.maybe_update()         # force an update check now (exits if updating)
             elif cmd:
                 _run_remote_command(cmd)
+            # Admin chat + notices — spin up the on-screen UI only when there's
+            # something to show, then feed every heartbeat so it can re-raise / clear.
+            chat = d.get('chat') or []
+            notices = d.get('notices') or []
+            if (chat or notices) and self.chat_ui is None and self.token:
+                self.chat_ui = ChatUI(self.server, self.token)
+                self.chat_ui.start()
+            if self.chat_ui:
+                self.chat_ui.feed(chat, notices)
         except Exception:
             pass
 

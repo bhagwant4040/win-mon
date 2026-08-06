@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.5'
+APP_VERSION = '2.6'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -339,20 +339,27 @@ class ChatUI:
         w = self.root
         w.title('Message from Admin')
         w.configure(bg='#0f172a')
-        w.geometry('380x460')
+        w.geometry('380x480')
+        w.minsize(340, 400)
         tk.Label(w, text='  Admin Chat', bg='#0088FF', fg='white', anchor='w',
-                 font=('Segoe UI', 11, 'bold'), pady=6).pack(fill='x')
+                 font=('Segoe UI', 11, 'bold'), pady=6).pack(side='top', fill='x')
+        # IMPORTANT: pin the reply bar to the BOTTOM *first* so pack can never clip
+        # it off-screen when the window is short; the conversation fills the rest.
+        bar = tk.Frame(w, bg='#0f172a'); bar.pack(side='bottom', fill='x')
+        tk.Label(bar, text='Your reply:', bg='#0f172a', fg='#cbd5e1',
+                 font=('Segoe UI', 9)).pack(side='top', anchor='w', padx=8, pady=(6, 0))
+        row = tk.Frame(bar, bg='#0f172a'); row.pack(side='top', fill='x')
+        self.entry = tk.Entry(row, font=('Segoe UI', 11))
+        self.entry.pack(side='left', fill='x', expand=True, padx=(8, 4), pady=8, ipady=4)
+        self.entry.bind('<Return>', lambda e: self._send())
+        tk.Button(row, text='Send', command=self._send, bg='#0088FF', fg='white', bd=0,
+                  activebackground='#0069cc', font=('Segoe UI', 10, 'bold'),
+                  padx=16, pady=4).pack(side='right', padx=(4, 8), pady=8)
         self.txt = tk.Text(w, wrap='word', state='disabled', bg='#f6f8fb', fg='#111',
                            font=('Segoe UI', 10), bd=0, padx=10, pady=10)
         self.txt.tag_configure('admin_h', foreground='#0088FF', font=('Segoe UI', 10, 'bold'))
         self.txt.tag_configure('me_h', foreground='#16a34a', font=('Segoe UI', 10, 'bold'))
-        self.txt.pack(fill='both', expand=True)
-        bar = tk.Frame(w, bg='#0f172a'); bar.pack(fill='x')
-        self.entry = tk.Entry(bar, font=('Segoe UI', 10))
-        self.entry.pack(side='left', fill='x', expand=True, padx=6, pady=6)
-        self.entry.bind('<Return>', lambda e: self._send())
-        tk.Button(bar, text='Send', command=self._send, bg='#0088FF', fg='white', bd=0,
-                  activebackground='#0069cc', font=('Segoe UI', 10, 'bold'), padx=14).pack(side='right', padx=6, pady=6)
+        self.txt.pack(side='top', fill='both', expand=True)
         w.protocol('WM_DELETE_WINDOW', self._hide_chat)
 
     def _hide_chat(self):
@@ -441,13 +448,10 @@ class ChatUI:
             return
         nid = n.get('id')
         top.title('Notice')
-        top.configure(bg='#ffffff'); top.geometry('440x320')
+        top.configure(bg='#ffffff'); top.geometry('440x340'); top.minsize(360, 260)
         top.attributes('-topmost', True)
         tk.Label(top, text=n.get('title', 'Notice'), bg='#dc2626', fg='white', anchor='w',
-                 font=('Segoe UI', 12, 'bold'), padx=14, pady=9).pack(fill='x')
-        body = tk.Text(top, wrap='word', font=('Segoe UI', 11), bd=0, padx=14, pady=14)
-        body.insert('1.0', n.get('body', '')); body.configure(state='disabled')
-        body.pack(fill='both', expand=True)
+                 font=('Segoe UI', 12, 'bold'), padx=14, pady=9).pack(side='top', fill='x')
 
         def ack():
             threading.Thread(target=self._post_ack, args=(nid,), daemon=True).start()
@@ -455,8 +459,12 @@ class ChatUI:
             try: top.destroy()
             except Exception: pass
 
+        # pin the acknowledge button to the bottom FIRST so it's never clipped
         tk.Button(top, text='I have read this', command=ack, bg='#12b34a', fg='white', bd=0,
-                  activebackground='#0f9a40', font=('Segoe UI', 11, 'bold'), pady=9).pack(fill='x', side='bottom')
+                  activebackground='#0f9a40', font=('Segoe UI', 11, 'bold'), pady=9).pack(side='bottom', fill='x')
+        body = tk.Text(top, wrap='word', font=('Segoe UI', 11), bd=0, padx=14, pady=14)
+        body.insert('1.0', n.get('body', '')); body.configure(state='disabled')
+        body.pack(side='top', fill='both', expand=True)
         # can't dismiss without acknowledging
         top.protocol('WM_DELETE_WINDOW', lambda: (top.lift(), top.attributes('-topmost', True)))
         self._notice_wins[nid] = top

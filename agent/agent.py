@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.7'
+APP_VERSION = '2.8'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -1518,6 +1518,46 @@ class Tracker:
             time.sleep(1.5 if time.time() < self._live_until else self.sample_int)
 
 
+# ── Autostart: survive both a reboot AND a mid-session crash ──────────────────
+# Nothing else on the PC restarts this process if it dies (e.g. killed, crashed,
+# a corrupted self-update). Two Task Scheduler entries, both idempotent + silent:
+#   winMonAutostart — fires at logon (reboot / logoff-logon recovery)
+#   winMonWatchdog  — fires every 5 min; if an instance is already running the
+#                     single-instance lock makes this new launch exit immediately
+#                     via --autostart (no visible window) — so it's a no-op unless
+#                     the real agent has actually died, in which case it revives it.
+_AUTOSTART_TASKS = {'winMonAutostart': ['/sc', 'onlogon'],
+                    'winMonWatchdog': ['/sc', 'minute', '/mo', '5']}
+
+
+def _task_exists(name):
+    try:
+        r = subprocess.run(['schtasks', '/query', '/tn', name],
+                           capture_output=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_autostart():
+    """Register the Task Scheduler entries if missing. Only meaningful for the
+    packaged exe (not a dev python run); any failure is swallowed — monitoring
+    must never be blocked by this."""
+    if not getattr(sys, 'frozen', False):
+        return
+    try:
+        exe = sys.executable
+        tr = '"%s" --autostart' % exe
+        for name, sched in _AUTOSTART_TASKS.items():
+            if _task_exists(name):
+                continue
+            subprocess.run(['schtasks', '/create', '/tn', name, '/tr', tr,
+                            '/rl', 'limited', '/f'] + sched,
+                           capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
 def _acquire_single_instance(retries=1):
     """Return a bound socket if we are the first/only monitor process, else None.
     Retries briefly (used after a self-update, to wait for the old process to
@@ -1552,14 +1592,19 @@ def main():
 
     # Already registered. If a monitor is already running, this launch is the
     # user asking "show my ID / status" → display it and exit. After a self-update
-    # (--relaunch) we instead wait for the old copy to release the port.
+    # (--relaunch) we instead wait for the old copy to release the port. The
+    # watchdog/logon autostart tasks invoke us with --autostart — if an instance
+    # is already alive that's a harmless no-op, so exit silently (no status popup).
     relaunch = '--relaunch' in sys.argv
+    autostart = '--autostart' in sys.argv
     lock = _acquire_single_instance(retries=(15 if relaunch else 1))
     if lock is None:
-        if relaunch:
+        if relaunch or autostart:
             return          # old copy still holding on; autostart will recover
         show_status_dialog(cfg)
         return
+
+    threading.Thread(target=_ensure_autostart, daemon=True).start()
 
     # We are the monitor process. Runs forever; only the admin can stop it (revoke).
     while True:

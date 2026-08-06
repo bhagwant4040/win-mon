@@ -22,7 +22,7 @@ import subprocess
 
 import requests
 
-APP_VERSION = '2.3'
+APP_VERSION = '2.4'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -119,6 +119,9 @@ class TalkSession:
         self.out_stream = None
         self.alive = False
         self._ind = None
+        self._warn = ''
+        self.in_sr = 16000
+        self.out_sr = 16000
 
     def start(self):
         import sounddevice as sd
@@ -141,27 +144,113 @@ class TalkSession:
         self.ws = websocket.WebSocketApp(self.url, on_message=on_message, on_close=on_close)
         threading.Thread(target=lambda: self.ws.run_forever(ping_interval=20), daemon=True).start()
 
+        # Open at each device's NATIVE samplerate (WASAPI shared-mode mix rate) and
+        # resample to/from the 16 kHz wire format in software. Forcing 16 kHz on the
+        # host API (esp. MME) is what raised PaError -9999 / "MME error" on some PCs.
+        self.in_sr, in_dev = self._pick(sd, 'input')
+        self.out_sr, out_dev = self._pick(sd, 'output')
+
         def in_cb(indata, frames, tinfo, status):
             try:
+                mono = indata[:, 0] if getattr(indata, 'ndim', 1) > 1 else indata
+                ds = self._resample(mono, self.in_sr, self.RATE)
                 if self.ws and self.ws.sock and self.ws.sock.connected:
-                    self.ws.send(indata.tobytes(), websocket.ABNF.OPCODE_BINARY)
+                    self.ws.send(ds.tobytes(), websocket.ABNF.OPCODE_BINARY)
             except Exception:
                 pass
 
         def out_cb(outdata, frames, tinfo, status):
-            need = frames * 2
+            need16 = int(round(frames * self.RATE / self.out_sr))
             with self.lock:
-                take = bytes(self.buf[:need]); del self.buf[:len(take)]
-            if len(take) < need:
-                take += b'\x00' * (need - len(take))
-            outdata[:, 0] = self._np.frombuffer(take, dtype='int16')
+                take = bytes(self.buf[:need16 * 2]); del self.buf[:len(take)]
+            src = self._np.frombuffer(take, dtype='int16')
+            up = self._resample(src, self.RATE, self.out_sr)
+            if len(up) < frames:
+                up = self._np.concatenate([up, self._np.zeros(frames - len(up), dtype='int16')])
+            outdata[:, 0] = up[:frames]
 
-        self.in_stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype='int16',
-                                        blocksize=self.BLK, callback=in_cb)
-        self.out_stream = sd.OutputStream(samplerate=self.RATE, channels=1, dtype='int16',
-                                          blocksize=self.BLK, callback=out_cb)
-        self.in_stream.start(); self.out_stream.start()
+        errs = []
+        # Speaker first (admin → PC), so the admin can still talk even if the mic is blocked.
+        try:
+            self.out_stream = sd.OutputStream(samplerate=self.out_sr, channels=1, dtype='int16',
+                                              blocksize=max(256, int(self.out_sr * 0.1)),
+                                              device=out_dev, callback=out_cb)
+            self.out_stream.start()
+        except Exception as ex:
+            self.out_stream = None
+            errs.append('speaker: ' + self._friendly(ex))
+        # Mic (PC → admin)
+        try:
+            self.in_stream = sd.InputStream(samplerate=self.in_sr, channels=1, dtype='int16',
+                                            blocksize=max(256, int(self.in_sr * 0.1)),
+                                            device=in_dev, callback=in_cb)
+            self.in_stream.start()
+        except Exception as ex:
+            self.in_stream = None
+            errs.append('mic: ' + self._friendly(ex))
+
+        if not self.in_stream and not self.out_stream:
+            self.alive = False
+            raise RuntimeError('; '.join(errs) or 'no audio devices')
+        self._warn = '; '.join(errs)          # non-fatal: one direction still works
         threading.Thread(target=self._indicator, daemon=True).start()
+
+    # ── device selection + resampling (keeps the 16 kHz wire format host-agnostic) ──
+    def _pick(self, sd, kind):
+        """Return (samplerate, device_index) for 'input'/'output', preferring WASAPI."""
+        ch_key = 'max_input_channels' if kind == 'input' else 'max_output_channels'
+        cands = []
+        try:
+            for a in sd.query_hostapis():
+                if 'wasapi' in a.get('name', '').lower():
+                    dd = a.get('default_' + kind + '_device', -1)
+                    if isinstance(dd, int) and dd >= 0:
+                        cands.append(dd)
+        except Exception:
+            pass
+        try:
+            gd = sd.default.device[0 if kind == 'input' else 1]
+            if isinstance(gd, int) and gd >= 0:
+                cands.append(gd)
+        except Exception:
+            pass
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d.get(ch_key, 0) > 0:
+                    cands.append(i)
+        except Exception:
+            pass
+        for idx in cands:
+            try:
+                d = sd.query_devices(idx)
+                if d.get(ch_key, 0) > 0:
+                    sr = int(d.get('default_samplerate') or 48000)
+                    return (sr if sr > 0 else 48000), idx
+            except Exception:
+                continue
+        return 48000, None                     # let PortAudio use its default device
+
+    def _resample(self, data, sr_from, sr_to):
+        np = self._np
+        if data is None or len(data) == 0:
+            return np.zeros(0, dtype='int16')
+        if sr_from == sr_to:
+            return data.astype('int16')
+        n_out = int(round(len(data) * sr_to / sr_from))
+        if n_out <= 0:
+            return np.zeros(0, dtype='int16')
+        xp = np.arange(len(data))
+        x = np.linspace(0, len(data) - 1, n_out)
+        return np.interp(x, xp, data.astype(np.float32)).astype('int16')
+
+    @staticmethod
+    def _friendly(ex):
+        s = str(ex); low = s.lower()
+        if ('-9999' in s or 'host error' in low or 'mme' in low
+                or 'unanticipated' in low or 'invalid device' in low):
+            return ('device blocked or in use — allow desktop apps in Windows '
+                    'Settings ▸ Privacy & security ▸ Microphone, or close the app using it')
+        return s
 
     def _indicator(self):
         try:
@@ -887,10 +976,13 @@ class Tracker:
             s = TalkSession(_talk_ws_url(self.server, self.token))
             s.start()
             _talk['session'] = s
-            self.event_queue.append({'type': 'voice', 'detail': 'Voice session started with admin',
-                                     'ts': time.time()})
+            warn = getattr(s, '_warn', '')
+            detail = 'Voice session started with admin' + ((' — ' + warn) if warn else '')
+            self.event_queue.append({'type': 'voice', 'detail': detail, 'ts': time.time()})
+            if warn:
+                self.report_error('voice partial: ' + warn)   # one direction only
         except Exception as ex:
-            self.report_error('voice start failed: %s' % ex)
+            self.report_error('voice start failed: %s' % TalkSession._friendly(ex))
 
     def _stop_talk(self):
         if _talk['session']:

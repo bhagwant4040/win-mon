@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.6'
+APP_VERSION = '2.7'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -514,7 +514,13 @@ def _apply_update(url):
     """Download and install the new exe, then relaunch it. Windows only.
     Uses the rename trick: a running .exe can be RENAMED (not overwritten) while
     running, so we move ourselves aside and drop the new exe into place — no batch
-    file, no console window, no waiting/retry loop."""
+    file, no console window, no waiting/retry loop.
+
+    A corrupt/truncated download here is catastrophic: once we exit, nothing is
+    left running to self-heal (no OS-level autostart is registered), and the
+    machine goes dark with no remote recovery path. So this verifies BOTH the
+    exact byte count (against Content-Length) AND the PE header before ever
+    swapping the file in, and rolls back if the relaunched process dies immediately."""
     if not getattr(sys, 'frozen', False):
         return False  # only update the packaged .exe, not a python/dev run
     exe = sys.executable
@@ -524,12 +530,22 @@ def _apply_update(url):
     try:
         with requests.get(url, stream=True, timeout=180) as r:
             r.raise_for_status()
+            expected = r.headers.get('Content-Length')
+            expected = int(expected) if expected and expected.isdigit() else None
+            got = 0
             with open(newexe, 'wb') as f:
                 for chunk in r.iter_content(65536):
                     if chunk:
-                        f.write(chunk)
-        if os.path.getsize(newexe) < 8_000_000:   # sanity: the real exe is ~15 MB
+                        f.write(chunk); got += len(chunk)
+        # Reject anything that isn't a complete, valid Windows executable —
+        # partial/corrupt downloads must never be installed.
+        if expected is not None and got != expected:
             os.remove(newexe); return False
+        if got < 40_000_000:            # sanity floor (current exe is ~83 MB)
+            os.remove(newexe); return False
+        with open(newexe, 'rb') as f:
+            if f.read(2) != b'MZ':      # valid PE/DOS header
+                os.remove(newexe); return False
     except Exception:
         try: os.remove(newexe)
         except OSError: pass
@@ -550,17 +566,30 @@ def _apply_update(url):
             if os.path.exists(newexe): os.remove(newexe)
         except OSError: pass
         return False
-    # 3) launch the freshly installed exe (detached, windowless) and exit.
+    # 3) launch the freshly installed exe (detached, windowless).
     #    Strip PyInstaller's _MEIPASS2 / _PYI_* env vars so the child does a FRESH
     #    onefile extraction instead of reusing our about-to-be-deleted temp dir —
     #    otherwise the child crashes with "No module named '_socket'".
     try:
         child_env = {k: v for k, v in os.environ.items()
                      if not (k.startswith('_MEI') or k.startswith('_PYI'))}
-        subprocess.Popen([exe, '--relaunch'], creationflags=0x00000008,  # DETACHED
-                         close_fds=True, env=child_env)
+        proc = subprocess.Popen([exe, '--relaunch'], creationflags=0x00000008,  # DETACHED
+                                close_fds=True, env=child_env)
     except Exception:
-        pass
+        proc = None
+    # 4) give the new process a moment to get past its earliest crash window
+    # (e.g. a corrupted exe that IS a valid PE header but fails on load) before
+    # we commit to exiting. If it already died, roll back to the known-good exe
+    # instead of leaving nothing running.
+    if proc is not None:
+        time.sleep(2.5)
+        if proc.poll() is not None:     # already exited — launch failed
+            try:
+                os.remove(exe)
+                os.rename(oldexe, exe)
+            except OSError:
+                pass
+            return False
     os._exit(0)
 
 

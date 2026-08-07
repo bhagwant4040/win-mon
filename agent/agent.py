@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.8'
+APP_VERSION = '2.9'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -475,6 +475,37 @@ class ChatUI:
                           json={'notice_id': nid}, timeout=10)
         except Exception:
             pass
+
+
+# ── Big on-screen alert (one-shot, auto-dismisses) ─────────────────────────────
+def _show_alert(message, duration_s):
+    """A big, unmissable message that auto-closes after duration_s seconds — no
+    reply/ack needed, unlike chat/notices. Runs its own Tk root in a dedicated
+    thread (same pattern as TalkSession's on-screen indicator), so it works even
+    if no chat window has ever opened on this PC."""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.attributes('-topmost', True)
+        try: root.overrideredirect(True)
+        except Exception: pass
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w = min(720, int(sw * 0.7))
+        h = 200
+        root.geometry('%dx%d+%d+%d' % (w, h, (sw - w) // 2, (sh - h) // 2))
+        root.configure(bg='#dc2626')
+        tk.Label(root, text='⚠ ALERT FROM ADMIN', bg='#dc2626', fg='white',
+                 font=('Segoe UI', 12, 'bold')).pack(pady=(16, 4))
+        tk.Label(root, text=str(message or ''), bg='#dc2626', fg='white', wraplength=w - 60,
+                 font=('Segoe UI', 17, 'bold'), justify='center').pack(padx=30, pady=6, fill='both', expand=True)
+        try:
+            dur_ms = max(500, int(float(duration_s) * 1000))
+        except (TypeError, ValueError):
+            dur_ms = 5000
+        root.after(dur_ms, root.destroy)
+        root.mainloop()
+    except Exception:
+        pass
 
 
 # ── Self-update (silent, from GitHub Releases) ────────────────────────────────
@@ -1195,6 +1226,12 @@ class Tracker:
                 self.chat_ui.start()
             if self.chat_ui:
                 self.chat_ui.feed(chat, notices)
+            # One-shot big alert — fire and forget, no reply/ack needed.
+            alert = d.get('alert')
+            if alert and alert.get('message'):
+                threading.Thread(target=_show_alert,
+                                 args=(alert.get('message', ''), alert.get('duration_s', 5)),
+                                 daemon=True).start()
         except Exception:
             pass
 

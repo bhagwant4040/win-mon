@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.9'
+APP_VERSION = '2.10'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -797,34 +797,52 @@ def get_idle_seconds():
 _BROWSERS = ('chrome', 'msedge', 'brave', 'firefox', 'opera', 'vivaldi')
 
 
-def get_browser_url(app):
+_url_cache_key = None   # (app, title) of the last UIA lookup — see get_browser_url
+_url_cache_val = ''
+
+
+def get_browser_url(app, title=''):
     """Best-effort: read the active browser's address bar via UI Automation.
     Returns a domain-ish string or ''. Fragile across browser versions — the
-    dashboard treats a missing URL gracefully."""
+    dashboard treats a missing URL gracefully.
+
+    UIA tree walks (searchDepth=25 + a 0.2s Exists() wait) are expensive —
+    tens to hundreds of ms of blocking COM/GIL time. Re-running this on every
+    5s sample tick while the SAME browser tab just sits focused was a real
+    source of system lag (the sampling loop shares the process/GIL with
+    pynput's global keyboard/mouse hooks, so blocking it stalls input too).
+    Only recompute when the (app, title) pair actually changes — title
+    reliably changes on tab switch/navigation in every mainstream browser."""
+    global _url_cache_key, _url_cache_val
     if not (_UIA and app):
         return ''
     a = app.lower()
     if not any(b in a for b in _BROWSERS):
         return ''
+    key = (app, title)
+    if key == _url_cache_key:
+        return _url_cache_val
+    url = ''
     try:
         hwnd = win32gui.GetForegroundWindow()
         ctrl = _uia.ControlFromHandle(hwnd)
-        if not ctrl:
-            return ''
-        # Chromium: an Edit named "Address and search bar". Firefox: "Search with…".
-        edit = ctrl.EditControl(searchDepth=25)
-        if edit and edit.Exists(0.2, 0):
-            val = ''
-            try:
-                val = edit.GetValuePattern().Value or ''
-            except Exception:
-                val = edit.Name or ''
-            val = (val or '').strip()
-            if val and ' ' not in val and '.' in val:
-                return val[:255]
+        if ctrl:
+            # Chromium: an Edit named "Address and search bar". Firefox: "Search with…".
+            edit = ctrl.EditControl(searchDepth=25)
+            if edit and edit.Exists(0.2, 0):
+                val = ''
+                try:
+                    val = edit.GetValuePattern().Value or ''
+                except Exception:
+                    val = edit.Name or ''
+                val = (val or '').strip()
+                if val and ' ' not in val and '.' in val:
+                    url = val[:255]
     except Exception:
-        return ''
-    return ''
+        url = ''
+    _url_cache_key = key
+    _url_cache_val = url
+    return url
 
 
 # ── activity intensity (keystroke + mouse-click COUNTS only, never content) ────
@@ -1146,6 +1164,8 @@ class Tracker:
         self._live_until = 0       # stream live frames while > time.time()
         self._cam_until = 0        # stream the webcam (not screen) while > time.time()
         self._cam = None           # open cv2.VideoCapture during camera mode
+        self._shot_busy = False    # guards capture_screenshot's background thread
+        self._sw_busy = False      # guards scan_software's background thread
 
     def _headers(self):
         return {'Authorization': 'Bearer ' + self.token} if self.token else {}
@@ -1202,7 +1222,7 @@ class Tracker:
                 return
             d = r.json() or {}
             if d.get('shot_now'):
-                self.capture_screenshot()   # captures & uploads regardless of the periodic toggle
+                self.capture_screenshot_bg()   # captures & uploads regardless of the periodic toggle
             if d.get('live'):
                 self._live_until = time.time() + 20   # keep streaming until re-confirmed
             self._cam_until = (time.time() + 20) if d.get('cam') else 0
@@ -1340,7 +1360,7 @@ class Tracker:
             app, title, url = '', '', ''
         else:
             app, title, pid = get_foreground()
-            url = get_browser_url(app)
+            url = get_browser_url(app, title)
             if self._enforce(app, title, url, pid):
                 # app was blocked/closed — don't log it as normal active use
                 app, title, url = app, '[blocked] ' + (title or ''), url
@@ -1376,6 +1396,21 @@ class Tracker:
                 self.viol_queue = batch + self.viol_queue
         except Exception:
             self.viol_queue = batch + self.viol_queue
+
+    def capture_screenshot_bg(self):
+        """Fire capture_screenshot() on a background thread — screen grab +
+        JPEG encode + upload can take a noticeable stretch of GIL time, and
+        running it inline on the main sampling loop was stalling pynput's
+        global keyboard/mouse hooks (perceived as system-wide input lag)."""
+        if self._shot_busy:
+            return
+        def go():
+            self._shot_busy = True
+            try:
+                self.capture_screenshot()
+            finally:
+                self._shot_busy = False
+        threading.Thread(target=go, daemon=True).start()
 
     def capture_screenshot(self):
         buf = capture_jpeg()
@@ -1466,6 +1501,21 @@ class Tracker:
         except Exception:
             pass
 
+    def scan_software_bg(self):
+        """Fire scan_software() on a background thread — registry enumeration
+        of every installed program is synchronous and can take a while on a
+        PC with lots of software; same GIL-contention reasoning as the
+        screenshot capture above."""
+        if self._sw_busy:
+            return
+        def go():
+            self._sw_busy = True
+            try:
+                self.scan_software()
+            finally:
+                self._sw_busy = False
+        threading.Thread(target=go, daemon=True).start()
+
     def scan_software(self):
         try:
             inst = list_installed_software()
@@ -1517,13 +1567,15 @@ class Tracker:
         self.send_health()
         self.run_detectors()      # establish baselines (no events on first pass)
         self.scan_software()
-        last_upload = last_health = last_shot = last_sw = last_pcheck = time.time()
+        last_upload = last_health = last_shot = last_sw = last_pcheck = last_det = time.time()
         last_upd = time.time()
         while self.token:
             try:
                 self.sample()
                 now = time.time()
-                self.run_detectors()   # cheap: USB + print each sample
+                if now - last_det >= 30:   # USB/print detection doesn't need 5s granularity
+                    self.run_detectors()
+                    last_det = now
                 # Poll for admin requests (screenshot / command / live). Poll faster
                 # while a Live View is active so it feels responsive.
                 live = now < self._live_until
@@ -1534,10 +1586,10 @@ class Tracker:
                 if live:
                     self.send_live_frame()
                 if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
-                    self.capture_screenshot()
+                    self.capture_screenshot_bg()
                     last_shot = now
                 if now - last_sw >= 300:               # software scan every 5 min
-                    self.scan_software()
+                    self.scan_software_bg()
                     last_sw = now
                 if now - last_upload >= self.upload_int:
                     self.upload()

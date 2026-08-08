@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.10'
+APP_VERSION = '2.11'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -1398,16 +1398,25 @@ class Tracker:
             self.viol_queue = batch + self.viol_queue
 
     def capture_screenshot_bg(self):
-        """Fire capture_screenshot() on a background thread — screen grab +
-        JPEG encode + upload can take a noticeable stretch of GIL time, and
-        running it inline on the main sampling loop was stalling pynput's
-        global keyboard/mouse hooks (perceived as system-wide input lag)."""
+        """v2.10 backgrounded the WHOLE capture (grab+encode+upload) to fix
+        input lag — but that put ImageGrab.grab() (a Windows GDI/display call)
+        on a non-main thread, which some PCs' GPU drivers handle badly: random
+        black-screen freezes, occasionally hard enough to lose work. GDI screen
+        capture has run on the main thread here since long before v2.10 (Live
+        View calls it every 1.5s with no such issue), so the grab+encode stays
+        on the calling thread — only the network upload (the actually slow,
+        GIL-holding part) is what runs in the background."""
+        buf = capture_jpeg()
+        if not buf:
+            self.report_error('screenshot capture failed — ' + (_shot_err or 'unknown'))
+            return
+        app, title, _pid = get_foreground()
         if self._shot_busy:
             return
         def go():
             self._shot_busy = True
             try:
-                self.capture_screenshot()
+                self._upload_screenshot(buf, app, title)
             finally:
                 self._shot_busy = False
         threading.Thread(target=go, daemon=True).start()
@@ -1418,6 +1427,9 @@ class Tracker:
             self.report_error('screenshot capture failed — ' + (_shot_err or 'unknown'))
             return
         app, title, _pid = get_foreground()
+        self._upload_screenshot(buf, app, title)
+
+    def _upload_screenshot(self, buf, app, title):
         try:
             r = requests.post(self.server + '/api/win/screenshot', headers=self._headers(),
                               files={'image': ('shot.jpg', buf, 'image/jpeg')},

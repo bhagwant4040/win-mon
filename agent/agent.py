@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.11'
+APP_VERSION = '2.12'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -1166,6 +1166,8 @@ class Tracker:
         self._cam = None           # open cv2.VideoCapture during camera mode
         self._shot_busy = False    # guards capture_screenshot's background thread
         self._sw_busy = False      # guards scan_software's background thread
+        self._live_upload_busy = False   # guards send_live_frame's background upload
+        self._pcheck_busy = False        # guards check_pending's background thread
 
     def _headers(self):
         return {'Authorization': 'Bearer ' + self.token} if self.token else {}
@@ -1212,8 +1214,27 @@ class Tracker:
             _apply_update(upd[1])   # exits & relaunches the new version if it succeeds
 
     def check_pending(self):
+        """Fire the heartbeat + admin-request check on a background thread — this
+        runs every 5s while Live View is active (see the main loop), and a
+        synchronous POST with a 10s timeout at that cadence was another
+        unaudited main-loop-blocking call in the same family as v2.10/v2.11's
+        fixes. Guarded so a slow/stuck request can't pile up new ones."""
+        if self._pcheck_busy:
+            return
+        def go():
+            self._pcheck_busy = True
+            try:
+                self._check_pending_body()
+            finally:
+                self._pcheck_busy = False
+        threading.Thread(target=go, daemon=True).start()
+
+    def _check_pending_body(self):
         """Heartbeat + honour admin requests: on-demand screenshot and remote
-        commands (lock / logoff / restart / shutdown)."""
+        commands (lock / logoff / restart / shutdown). Runs on a background
+        thread (see check_pending) — the state it sets (_live_until, _cam_until,
+        chat_ui, ...) is read by the main loop on its next pass; Python's GIL
+        makes the individual attribute assignments here safe without a lock."""
         try:
             r = requests.post(self.server + '/api/win/heartbeat',
                               headers=self._headers(),
@@ -1440,7 +1461,16 @@ class Tracker:
             self.report_error('screenshot upload error: %s' % ex)
 
     def send_live_frame(self):
-        """Upload one live-view frame — the screen, or the WEBCAM in camera mode."""
+        """Capture + upload one live-view frame — the screen, or the WEBCAM in
+        camera mode. Runs every 1.5s for as long as Live View is open, which
+        makes this the single most repeated caller of ImageGrab.grab() in the
+        whole agent — never audited in the v2.10/v2.11 lag/blackout fixes even
+        though it has the exact same shape of problem: capture (grab or webcam
+        read) stays on the calling thread as always (that part is safe — see
+        v2.11), but the upload is a synchronous HTTP POST with up to a 10s
+        timeout, repeating every 1.5s, which can stall the main loop — and
+        therefore the pynput hooks sharing its GIL — for far longer and far
+        more often than the periodic screenshot ever did."""
         if time.time() < self._cam_until:
             buf = self._webcam_frame()
         else:
@@ -1448,11 +1478,18 @@ class Tracker:
             buf = capture_jpeg(max_w=1100, quality=42)
         if not buf:
             return
-        try:
-            requests.post(self.server + '/api/win/live', headers=self._headers(),
-                          files={'image': ('live.jpg', buf, 'image/jpeg')}, timeout=10)
-        except Exception:
-            pass
+        if self._live_upload_busy:
+            return   # previous frame's upload still in flight — drop this one, don't pile up
+        def go():
+            self._live_upload_busy = True
+            try:
+                requests.post(self.server + '/api/win/live', headers=self._headers(),
+                              files={'image': ('live.jpg', buf, 'image/jpeg')}, timeout=10)
+            except Exception:
+                pass
+            finally:
+                self._live_upload_busy = False
+        threading.Thread(target=go, daemon=True).start()
 
     def _webcam_frame(self):
         """Capture one JPEG frame from the webcam (opens the camera; LED lights)."""

@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.12'
+APP_VERSION = '2.13'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -90,6 +90,56 @@ def _run_remote_command(cmd):
             subprocess.Popen(['shutdown', '/s', '/t', '0', '/f'], creationflags=flags)
     except Exception:
         pass
+
+
+# ── Shared Tk UI thread ────────────────────────────────────────────────────────
+# Chat, notices, the big on-screen alert, and the voice-call indicator each used
+# to create their OWN independent tk.Tk() root on their OWN thread. Tcl/Tk on
+# Windows is not safe with more than one interpreter/root touching the display
+# at once from different threads — running two or more of these features at
+# overlapping times (e.g. an alert firing while a chat window is open) is what
+# was causing the random screen flicker / freezes / hangs reported after the
+# alert feature shipped (v2.9) made that overlap possible for the first time.
+# Fix: ONE process-wide Tk root + mainloop, lazily started on first use; every
+# feature below now builds a Toplevel under this shared root instead of its
+# own root, and schedules work onto it via .run() (safe to call from any thread
+# — it just queues a Tcl event via .after(0, ...), it doesn't touch widgets
+# directly from the calling thread).
+class _UIManager:
+    def __init__(self):
+        self.root = None
+        self._started = False
+        self._lock = threading.Lock()
+
+    def ensure_started(self):
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            threading.Thread(target=self._run, daemon=True).start()
+        for _ in range(150):   # wait up to ~3s for the root to exist
+            if self.root is not None:
+                return
+            time.sleep(0.02)
+
+    def _run(self):
+        try:
+            import tkinter as tk
+            self.root = tk.Tk()
+            self.root.withdraw()   # this root is never itself shown — only Toplevels are
+            self.root.mainloop()
+        except Exception:
+            pass
+
+    def run(self, fn):
+        """Schedule fn to run on the shared Tk thread. Safe from any thread."""
+        self.ensure_started()
+        if self.root is not None:
+            try: self.root.after(0, fn)
+            except Exception: pass
+
+
+_ui = _UIManager()
 
 
 # ── Two-way voice (admin ↔ this PC) ───────────────────────────────────────────
@@ -194,7 +244,7 @@ class TalkSession:
             self.alive = False
             raise RuntimeError('; '.join(errs) or 'no audio devices')
         self._warn = '; '.join(errs)          # non-fatal: one direction still works
-        threading.Thread(target=self._indicator, daemon=True).start()
+        _ui.run(self._indicator)
 
     # ── device selection + resampling (keeps the 16 kHz wire format host-agnostic) ──
     def _pick(self, sd, kind):
@@ -254,9 +304,11 @@ class TalkSession:
         return s
 
     def _indicator(self):
+        # Runs ON the shared Tk thread (scheduled via _ui.run in start()) — builds
+        # a Toplevel under the one process-wide root instead of its own tk.Tk().
         try:
             import tkinter as tk
-            r = tk.Tk(); r.overrideredirect(True); r.attributes('-topmost', True)
+            r = tk.Toplevel(_ui.root); r.overrideredirect(True); r.attributes('-topmost', True)
             try: r.attributes('-alpha', 0.92)
             except Exception: pass
             r.configure(bg='#dc2626')
@@ -272,7 +324,7 @@ class TalkSession:
                     except Exception: pass
                     return
                 r.after(400, poll)
-            poll(); r.mainloop()
+            poll()
         except Exception:
             pass
 
@@ -313,7 +365,7 @@ class ChatUI:
         if self._started:
             return
         self._started = True
-        threading.Thread(target=self._ui_thread, daemon=True).start()
+        _ui.run(self._ui_thread)
 
     def feed(self, chat, notices):
         """Called from the heartbeat thread — never touches widgets directly."""
@@ -323,14 +375,16 @@ class ChatUI:
         return {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'}
 
     def _ui_thread(self):
+        # Runs ON the shared Tk thread (scheduled via _ui.run in start()) — this
+        # window is a Toplevel under the one process-wide root, not its own root,
+        # so it can safely coexist with alerts / the voice indicator.
         try:
             import tkinter as tk
             self._tk = tk
-            self.root = tk.Tk()
+            self.root = tk.Toplevel(_ui.root)
             self.root.withdraw()          # hidden until there's something to show
             self._build_chat()
             self.root.after(300, self._drain)
-            self.root.mainloop()
         except Exception:
             pass
 
@@ -480,12 +534,14 @@ class ChatUI:
 # ── Big on-screen alert (one-shot, auto-dismisses) ─────────────────────────────
 def _show_alert(message, duration_s):
     """A big, unmissable message that auto-closes after duration_s seconds — no
-    reply/ack needed, unlike chat/notices. Runs its own Tk root in a dedicated
-    thread (same pattern as TalkSession's on-screen indicator), so it works even
-    if no chat window has ever opened on this PC."""
+    reply/ack needed, unlike chat/notices. Runs ON the shared Tk thread (see
+    _UIManager) as a Toplevel under the one process-wide root, so it can safely
+    fire even while chat/notices or the voice indicator are already showing —
+    used to create its own independent tk.Tk() root here, which is what caused
+    the random screen flicker/freezes once alerts could overlap with those."""
     try:
         import tkinter as tk
-        root = tk.Tk()
+        root = tk.Toplevel(_ui.root)
         root.attributes('-topmost', True)
         try: root.overrideredirect(True)
         except Exception: pass
@@ -503,7 +559,6 @@ def _show_alert(message, duration_s):
         except (TypeError, ValueError):
             dur_ms = 5000
         root.after(dur_ms, root.destroy)
-        root.mainloop()
     except Exception:
         pass
 
@@ -1270,9 +1325,8 @@ class Tracker:
             # One-shot big alert — fire and forget, no reply/ack needed.
             alert = d.get('alert')
             if alert and alert.get('message'):
-                threading.Thread(target=_show_alert,
-                                 args=(alert.get('message', ''), alert.get('duration_s', 5)),
-                                 daemon=True).start()
+                msg, dur = alert.get('message', ''), alert.get('duration_s', 5)
+                _ui.run(lambda: _show_alert(msg, dur))
         except Exception:
             pass
 

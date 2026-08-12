@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.16'
+APP_VERSION = '2.17'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -142,18 +142,22 @@ class _UIManager:
 _ui = _UIManager()
 
 
-# ── Local camera/mic privacy toggle ────────────────────────────────────────────
+# ── Local privacy toggle (full kill-switch) ────────────────────────────────────
 # A separate standalone app (winMon Privacy Toggle) lets the employee flip this
 # HKCU value with one click, purely on-device — no server round-trip, doesn't
-# need winMon to even be running. Checked right at the point the webcam/mic
-# would actually be opened (TalkSession.start / _webcam_frame below), so it
-# wins over whatever the admin/server asked for. Missing key/value = allowed
-# (default), matching "off means normal operation."
+# need winMon to even be running. When set, Tracker.run()'s main loop skips
+# EVERYTHING for as long as it stays set: activity sampling, screenshots,
+# software/USB/print detection, the heartbeat itself (so the PC reads as
+# offline on the dashboard, not just "camera/mic off"), and — as defense in
+# depth — the webcam/mic are also refused directly at the point they'd open
+# (TalkSession.start / the cam-until heartbeat handler below), in case a
+# background check-in was already mid-flight when the flag flipped. Missing
+# key/value = allowed (default), matching "off means normal operation."
 _REG_PRIVACY_KEY = r'Software\winMon\Privacy'
 _REG_PRIVACY_VALUE = 'CamMicBlocked'
 
 
-def _cam_mic_locally_blocked():
+def _locally_blocked():
     if not _WIN:
         return False
     try:
@@ -260,7 +264,7 @@ class TalkSession:
         # blocked it via the Privacy Toggle app; treated the same as any other
         # mic-open failure so the existing "one direction still works" handling
         # below applies unchanged (speaker keeps working either way).
-        if _cam_mic_locally_blocked():
+        if _locally_blocked():
             self.in_stream = None
             errs.append('mic: blocked locally by employee (Privacy Toggle)')
         else:
@@ -1359,7 +1363,7 @@ class Tracker:
                 self.capture_screenshot_bg()   # captures & uploads regardless of the periodic toggle
             if d.get('live'):
                 self._live_until = time.time() + 20   # keep streaming until re-confirmed
-            cam_blocked = d.get('cam') and _cam_mic_locally_blocked()
+            cam_blocked = d.get('cam') and _locally_blocked()
             if cam_blocked:
                 self.report_error('Camera blocked locally by employee (Privacy Toggle)')
             self._cam_until = (time.time() + 20) if (d.get('cam') and not cam_blocked) else 0
@@ -1743,6 +1747,17 @@ class Tracker:
         last_upd = time.time()
         while self.token:
             try:
+                if _locally_blocked():
+                    # Full kill-switch: tear down anything already active (all
+                    # purely local, no network needed) and skip every network
+                    # call this pass — no heartbeat means the PC reads as
+                    # offline on the dashboard, not just "camera/mic off".
+                    self._release_cam()
+                    self._stop_talk()
+                    self._live_until = 0
+                    self._cam_until = 0
+                    time.sleep(self.sample_int)
+                    continue
                 self.sample()
                 now = time.time()
                 if now - last_det >= 30:   # USB/print detection doesn't need 5s granularity

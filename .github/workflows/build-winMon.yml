@@ -28,10 +28,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      # A .exe with no publisher/version metadata (right-click → Properties →
+      # Details is blank) is one of the signals Defender's heuristics weigh
+      # when scoring an unsigned binary as suspicious — this stamps the
+      # CURRENT APP_VERSION into version_info.txt's placeholders so it's
+      # never stale, then PyInstaller embeds it as a real Windows version
+      # resource below (--version-file).
+      - name: Stamp version info
+        shell: bash
+        working-directory: agent
+        run: |
+          VER=$(grep -oE "APP_VERSION = '[^']+'" agent.py | head -1 | cut -d"'" -f2)
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          echo "stamping version $MAJOR.$MINOR.0.0"
+          sed -i "s/2, 14, 0, 0/${MAJOR}, ${MINOR}, 0, 0/g; s/2\.14\.0\.0/${MAJOR}.${MINOR}.0.0/g" version_info.txt
+
       - name: Build winMon.exe
         working-directory: agent
         run: >
-          pyinstaller --noconsole --onefile --name winMon
+          pyinstaller --noconsole --onefile --name winMon --noupx
+          --version-file version_info.txt
           --hidden-import win32gui --hidden-import win32process --hidden-import win32api
           --hidden-import win32file --hidden-import win32print --hidden-import winreg
           --hidden-import psutil --hidden-import uiautomation

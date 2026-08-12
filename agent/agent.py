@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.15'
+APP_VERSION = '2.16'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -142,6 +142,32 @@ class _UIManager:
 _ui = _UIManager()
 
 
+# ── Local camera/mic privacy toggle ────────────────────────────────────────────
+# A separate standalone app (winMon Privacy Toggle) lets the employee flip this
+# HKCU value with one click, purely on-device — no server round-trip, doesn't
+# need winMon to even be running. Checked right at the point the webcam/mic
+# would actually be opened (TalkSession.start / _webcam_frame below), so it
+# wins over whatever the admin/server asked for. Missing key/value = allowed
+# (default), matching "off means normal operation."
+_REG_PRIVACY_KEY = r'Software\winMon\Privacy'
+_REG_PRIVACY_VALUE = 'CamMicBlocked'
+
+
+def _cam_mic_locally_blocked():
+    if not _WIN:
+        return False
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_PRIVACY_KEY)
+        try:
+            val, _ = winreg.QueryValueEx(k, _REG_PRIVACY_VALUE)
+            return bool(val)
+        finally:
+            winreg.CloseKey(k)
+    except Exception:
+        return False
+
+
 # ── Two-way voice (admin ↔ this PC) ───────────────────────────────────────────
 _talk = {'session': None}
 
@@ -230,15 +256,22 @@ class TalkSession:
         except Exception as ex:
             self.out_stream = None
             errs.append('speaker: ' + self._friendly(ex))
-        # Mic (PC → admin)
-        try:
-            self.in_stream = sd.InputStream(samplerate=self.in_sr, channels=1, dtype='int16',
-                                            blocksize=max(256, int(self.in_sr * 0.1)),
-                                            device=in_dev, callback=in_cb)
-            self.in_stream.start()
-        except Exception as ex:
+        # Mic (PC → admin) — skipped entirely if the employee has locally
+        # blocked it via the Privacy Toggle app; treated the same as any other
+        # mic-open failure so the existing "one direction still works" handling
+        # below applies unchanged (speaker keeps working either way).
+        if _cam_mic_locally_blocked():
             self.in_stream = None
-            errs.append('mic: ' + self._friendly(ex))
+            errs.append('mic: blocked locally by employee (Privacy Toggle)')
+        else:
+            try:
+                self.in_stream = sd.InputStream(samplerate=self.in_sr, channels=1, dtype='int16',
+                                                blocksize=max(256, int(self.in_sr * 0.1)),
+                                                device=in_dev, callback=in_cb)
+                self.in_stream.start()
+            except Exception as ex:
+                self.in_stream = None
+                errs.append('mic: ' + self._friendly(ex))
 
         if not self.in_stream and not self.out_stream:
             self.alive = False
@@ -1326,8 +1359,11 @@ class Tracker:
                 self.capture_screenshot_bg()   # captures & uploads regardless of the periodic toggle
             if d.get('live'):
                 self._live_until = time.time() + 20   # keep streaming until re-confirmed
-            self._cam_until = (time.time() + 20) if d.get('cam') else 0
-            if not d.get('cam'):
+            cam_blocked = d.get('cam') and _cam_mic_locally_blocked()
+            if cam_blocked:
+                self.report_error('Camera blocked locally by employee (Privacy Toggle)')
+            self._cam_until = (time.time() + 20) if (d.get('cam') and not cam_blocked) else 0
+            if not self._cam_until:
                 self._release_cam()               # turn the webcam (LED) back off promptly
             if d.get('talk'):
                 self._ensure_talk()

@@ -1,0 +1,35 @@
+name: Build winMon Privacy Toggle.exe
+
+# Builds the standalone camera/mic privacy toggle into a single .exe in the
+# cloud (GitHub's Windows runners) and uploads it as a downloadable artifact.
+# No auto-update / release mechanism — this is a tiny, dependency-free utility
+# (stdlib tkinter + winreg only) that just flips a local registry value.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['toggle/**']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build winMonPrivacyToggle.exe
+        working-directory: toggle
+        run: pyinstaller --noconsole --onefile --name winMonPrivacyToggle toggle_app.py
+
+      - name: Upload winMonPrivacyToggle.exe (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: winMonPrivacyToggle-exe
+          path: toggle/dist/winMonPrivacyToggle.exe
+          if-no-files-found: error

@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.14'
+APP_VERSION = '2.15'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -1758,7 +1758,8 @@ _AUTOSTART_TASKS = {'winMonAutostart': ['/sc', 'onlogon'],
 def _task_exists(name):
     try:
         r = subprocess.run(['schtasks', '/query', '/tn', name],
-                           capture_output=True, timeout=10)
+                           capture_output=True, timeout=10,
+                           creationflags=(0x08000000 if os.name == 'nt' else 0))
         return r.returncode == 0
     except Exception:
         return False
@@ -1778,7 +1779,8 @@ def _ensure_autostart():
                 continue
             subprocess.run(['schtasks', '/create', '/tn', name, '/tr', tr,
                             '/rl', 'limited', '/f'] + sched,
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           creationflags=(0x08000000 if os.name == 'nt' else 0))
     except Exception:
         pass
 

@@ -69,7 +69,10 @@ jobs:
 
       # Publish a GitHub Release tagged with the agent's APP_VERSION and attach
       # winMon.exe. Installed agents check the "latest" release and self-update.
+      # main only — a push to any other branch (e.g. a throwaway build/test
+      # branch) must never auto-publish a release the whole fleet picks up.
       - name: Publish release for auto-update
+        if: github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

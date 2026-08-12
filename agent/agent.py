@@ -23,7 +23,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.13'
+APP_VERSION = '2.14'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -932,27 +932,52 @@ def start_intensity():
 _shot_err = ''
 
 
-def capture_jpeg(max_w=1366, quality=55):
-    """Grab the screen → downscaled JPEG in a BytesIO buffer. On failure records
-    the reason in _shot_err and returns None."""
+def _grab_raw():
+    """Just the GDI screen capture — nothing else. Multi-monitor + high-res
+    setups can make this genuinely slow, but it's the one part of the whole
+    screenshot pipeline that MUST stay on the calling thread (backgrounding
+    ImageGrab.grab() itself is what caused v2.10/v2.11's black-screen bug —
+    see that history before ever moving this off-thread again). Returns a
+    PIL Image or None; failure reason lands in _shot_err."""
     global _shot_err
     try:
         from PIL import ImageGrab
-        import io
         img = ImageGrab.grab(all_screens=True)
         if img is None:
             _shot_err = 'ImageGrab.grab() returned None'; return None
-        if img.width > max_w:
-            r = max_w / float(img.width)
-            img = img.resize((max_w, int(img.height * r)))
-        buf = io.BytesIO()
-        img.convert('RGB').save(buf, 'JPEG', quality=quality)
-        buf.seek(0)
         _shot_err = ''
-        return buf
+        return img
     except Exception as ex:
         _shot_err = '%s: %s' % (type(ex).__name__, ex)
         return None
+
+
+def _encode_jpeg(img, max_w=1366, quality=55):
+    """Resize + JPEG-encode an already-captured Image. Pure Pillow/CPU work
+    on an in-memory bitmap — no GDI/display call anywhere in here — so unlike
+    _grab_raw() this is completely safe to run on a background thread. For a
+    big multi-monitor capture this resize+encode step, not the grab itself,
+    was the remaining chunk of main-thread blocking time after v2.11."""
+    import io
+    if img.width > max_w:
+        r = max_w / float(img.width)
+        img = img.resize((max_w, int(img.height * r)))
+    buf = io.BytesIO()
+    img.convert('RGB').save(buf, 'JPEG', quality=quality)
+    buf.seek(0)
+    return buf
+
+
+def capture_jpeg(max_w=1366, quality=55):
+    """Grab the screen → downscaled JPEG in a BytesIO buffer, both on the
+    calling thread. Kept as one call for existing callers that want the
+    whole pipeline synchronously; capture_screenshot_bg() below instead
+    calls _grab_raw()/_encode_jpeg() separately to background just the slow
+    encode step. On failure records the reason in _shot_err and returns None."""
+    img = _grab_raw()
+    if img is None:
+        return None
+    return _encode_jpeg(img, max_w, quality)
 
 
 def list_removable_drives():
@@ -1478,11 +1503,15 @@ class Tracker:
         on a non-main thread, which some PCs' GPU drivers handle badly: random
         black-screen freezes, occasionally hard enough to lose work. GDI screen
         capture has run on the main thread here since long before v2.10 (Live
-        View calls it every 1.5s with no such issue), so the grab+encode stays
-        on the calling thread — only the network upload (the actually slow,
-        GIL-holding part) is what runs in the background."""
-        buf = capture_jpeg()
-        if not buf:
+        View calls it every 1.5s with no such issue), so ONLY the raw grab
+        stays on the calling thread — v2.14: the resize+JPEG-encode step
+        (pure Pillow/CPU work on an already-captured bitmap, no GDI call in
+        it at all) now moves to the background thread too, along with the
+        upload. On a big multi-monitor/high-res rig, encoding a full-res
+        capture can itself take a real chunk of time — this was the
+        remaining main-thread blocking cost after v2.11's fix."""
+        img = _grab_raw()
+        if img is None:
             self.report_error('screenshot capture failed — ' + (_shot_err or 'unknown'))
             return
         app, title, _pid = get_foreground()
@@ -1491,6 +1520,7 @@ class Tracker:
         def go():
             self._shot_busy = True
             try:
+                buf = _encode_jpeg(img)
                 self._upload_screenshot(buf, app, title)
             finally:
                 self._shot_busy = False
@@ -1518,27 +1548,30 @@ class Tracker:
         """Capture + upload one live-view frame — the screen, or the WEBCAM in
         camera mode. Runs every 1.5s for as long as Live View is open, which
         makes this the single most repeated caller of ImageGrab.grab() in the
-        whole agent — never audited in the v2.10/v2.11 lag/blackout fixes even
-        though it has the exact same shape of problem: capture (grab or webcam
-        read) stays on the calling thread as always (that part is safe — see
-        v2.11), but the upload is a synchronous HTTP POST with up to a 10s
-        timeout, repeating every 1.5s, which can stall the main loop — and
-        therefore the pynput hooks sharing its GIL — for far longer and far
-        more often than the periodic screenshot ever did."""
+        whole agent. Grab (or webcam read) stays on the calling thread as
+        always (that part is safe — see v2.11); v2.14 also moved the
+        resize+encode + upload to the background thread (webcam frames were
+        already cheap via cv2 so this mainly matters for the screen-capture
+        branch on big/multi-monitor rigs)."""
         if time.time() < self._cam_until:
             buf = self._webcam_frame()
+            img = None
         else:
             self._release_cam()
-            buf = capture_jpeg(max_w=1100, quality=42)
-        if not buf:
+            img = _grab_raw()
+            buf = None
+        if img is None and buf is None:
             return
         if self._live_upload_busy:
             return   # previous frame's upload still in flight — drop this one, don't pile up
         def go():
             self._live_upload_busy = True
             try:
+                payload = buf if buf is not None else _encode_jpeg(img, max_w=1100, quality=42)
+                if payload is None:
+                    return
                 requests.post(self.server + '/api/win/live', headers=self._headers(),
-                              files={'image': ('live.jpg', buf, 'image/jpeg')}, timeout=10)
+                              files={'image': ('live.jpg', payload, 'image/jpeg')}, timeout=10)
             except Exception:
                 pass
             finally:

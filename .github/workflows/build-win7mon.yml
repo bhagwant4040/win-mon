@@ -1,0 +1,64 @@
+name: Build win7Mon.exe
+
+# Same agent.py as winMon, built against Python 3.8 (the last CPython release
+# with real Windows 7 support) so it runs on Windows 7 PCs, where the regular
+# Python 3.11 build fails with "Failed to load Python DLL ... python311.dll"
+# (missing Universal C Runtime, which Win7 doesn't ship).
+#
+# Artifact-only, deliberately — this must NEVER auto-publish a release. The
+# main fleet (Windows 10/11) stays on the regular winMon.exe/Python 3.11
+# build via build-winMon.yml; this is a separate, manually-distributed
+# variant for the handful of Windows 7 holdouts.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['agent/agent.py', 'agent/requirements-win7.txt']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
+      - name: Install dependencies
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-win7.txt pyinstaller
+
+      - name: Stamp version info
+        shell: bash
+        working-directory: agent
+        run: |
+          VER=$(grep -oE "APP_VERSION = '[^']+'" agent.py | head -1 | cut -d"'" -f2)
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          sed -i "s/2, 14, 0, 0/${MAJOR}, ${MINOR}, 0, 0/g; s/2\.14\.0\.0/${MAJOR}.${MINOR}.0.0/g" version_info.txt
+
+      - name: Build win7Mon.exe
+        working-directory: agent
+        run: >
+          pyinstaller --noconsole --onefile --name win7Mon --noupx
+          --version-file version_info.txt
+          --hidden-import win32gui --hidden-import win32process --hidden-import win32api
+          --hidden-import win32file --hidden-import win32print --hidden-import winreg
+          --hidden-import psutil --hidden-import uiautomation
+          --collect-all PIL
+          --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin
+          --hidden-import pynput.keyboard --hidden-import pynput.mouse
+          --collect-all sounddevice --collect-all numpy
+          --hidden-import websocket --hidden-import numpy
+          --collect-all cv2 --hidden-import cv2
+          agent.py
+
+      - name: Upload win7Mon.exe (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: win7Mon-exe
+          path: agent/dist/win7Mon.exe
+          if-no-files-found: error

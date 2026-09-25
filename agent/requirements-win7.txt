@@ -1,15 +1,16 @@
 # Same agent.py, built against Python 3.8 for Windows 7 compatibility
 # (Python 3.9+ dropped Windows 7 support; its python3XX.dll depends on the
 # Universal C Runtime, which Windows 7 doesn't ship — see win7Mon build).
-# Only Pillow and numpy differ from requirements.txt: their versions there
+# Pillow, numpy, and mss differ from requirements.txt: their versions there
 # require Python >=3.9, so pinned here to the latest release that still
-# supports 3.8. Everything else is identical.
+# supports 3.8 (mss 10.x dropped 3.8 support; 9.0.2 is the last that has it).
+# Everything else is identical.
 requests==2.32.3
 psutil==6.1.0
 pywin32==308
 uiautomation==2.0.20
 Pillow==10.4.0
-mss==10.2.0
+mss==9.0.2
 pynput==1.7.7
 sounddevice==0.4.7
 numpy==1.24.4

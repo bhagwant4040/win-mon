@@ -17,13 +17,15 @@ import time
 import uuid
 import socket
 import getpass
+import logging
+import logging.handlers
 import threading
 import subprocess
 import queue as _queue
 
 import requests
 
-APP_VERSION = '2.17'
+APP_VERSION = '2.18'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -34,6 +36,36 @@ UPDATE_REPO = 'bhagwant4040/win-mon'
 # Program Files. Holds server url, agent_id (persistent), employee_id, token.
 _CFG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'winMon')
 CONFIG_PATH = os.path.join(_CFG_DIR, 'config.json')
+
+# Local crash/diagnostic log (2026-09-25) — report_error() only ever phones
+# problems home over the network, so a crash/hang that kills connectivity (or
+# happens before the report goes out) left zero trace anywhere. This is a
+# small rotating file (1MB x 2 backups — deliberately tiny; several affected
+# PCs were found critically low on disk space, so this must never become part
+# of that problem) so that after an incident, someone can pull
+# %APPDATA%\winMon\agent.log and see the last thing the agent was doing
+# before a gap, instead of debugging blind.
+_LOG_PATH = os.path.join(_CFG_DIR, 'agent.log')
+
+
+def _init_logging():
+    try:
+        os.makedirs(_CFG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            _LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        lg = logging.getLogger('winmon')
+        lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
+        return lg
+    except Exception:
+        # Logging must never be why monitoring itself fails to start.
+        lg = logging.getLogger('winmon')
+        lg.addHandler(logging.NullHandler())
+        return lg
+
+
+log = _init_logging()
 
 
 def load_cfg():
@@ -649,6 +681,7 @@ def _apply_update(url):
     exe = sys.executable
     newexe = exe + '.new'
     oldexe = exe + '.old'
+    log.info('self-update: downloading %s', url)
     # 1) download the new exe alongside the current one
     try:
         with requests.get(url, stream=True, timeout=180) as r:
@@ -663,13 +696,17 @@ def _apply_update(url):
         # Reject anything that isn't a complete, valid Windows executable —
         # partial/corrupt downloads must never be installed.
         if expected is not None and got != expected:
+            log.error('self-update: size mismatch (got %s, expected %s), discarding', got, expected)
             os.remove(newexe); return False
         if got < 40_000_000:            # sanity floor (current exe is ~83 MB)
+            log.error('self-update: download too small (%s bytes), discarding', got)
             os.remove(newexe); return False
         with open(newexe, 'rb') as f:
             if f.read(2) != b'MZ':      # valid PE/DOS header
+                log.error('self-update: invalid PE header, discarding')
                 os.remove(newexe); return False
-    except Exception:
+    except Exception as ex:
+        log.error('self-update: download failed: %s', ex)
         try: os.remove(newexe)
         except OSError: pass
         return False
@@ -707,12 +744,14 @@ def _apply_update(url):
     if proc is not None:
         time.sleep(2.5)
         if proc.poll() is not None:     # already exited — launch failed
+            log.error('self-update: new exe died immediately, rolling back')
             try:
                 os.remove(exe)
                 os.rename(oldexe, exe)
             except OSError:
                 pass
             return False
+    log.info('self-update: installed, handing off and exiting')
     os._exit(0)
 
 
@@ -826,6 +865,18 @@ def collect_health():
         except Exception:
             bat = None
         net = psutil.net_io_counters()
+        # This agent's own OS handle count (2026-09-25) — added specifically to
+        # verify the v2.18 ImageGrab→mss switch actually fixed the suspected
+        # GDI-handle leak from repeated Live View captures: if handles climb
+        # steadily during/after a long Live View session on the dashboard's
+        # trend for this PC, the leak is still there; if it stays flat, it's
+        # fixed. num_handles() is Windows-only and counts ALL OS handles (not
+        # just GDI), so it's a coarse proxy, not a precise GDI-object count —
+        # good enough to catch a leak trending, not to diagnose its exact source.
+        try:
+            self_handles = psutil.Process().num_handles()
+        except Exception:
+            self_handles = None
         snap = {
             'cpu_pct': psutil.cpu_percent(interval=None),
             'mem_pct': vm.percent, 'mem_total_mb': int(vm.total / 1048576),
@@ -837,6 +888,7 @@ def collect_health():
             'num_procs': len(psutil.pids()),
             'net_sent_mb': round(net.bytes_sent / 1048576, 1),
             'net_recv_mb': round(net.bytes_recv / 1048576, 1),
+            'self_handles': self_handles,
         }
         snap.update(_device_caps())
         return snap
@@ -969,23 +1021,60 @@ def start_intensity():
 _shot_err = ''
 
 
+_mss_inst = None      # persistent mss context, reused across calls (see _grab_raw)
+_mss_grabs = 0        # calls since the instance was (re)created — forces a periodic refresh
+
+
 def _grab_raw():
-    """Just the GDI screen capture — nothing else. Multi-monitor + high-res
+    """Just the screen capture — nothing else. Multi-monitor + high-res
     setups can make this genuinely slow, but it's the one part of the whole
     screenshot pipeline that MUST stay on the calling thread (backgrounding
     ImageGrab.grab() itself is what caused v2.10/v2.11's black-screen bug —
     see that history before ever moving this off-thread again). Returns a
-    PIL Image or None; failure reason lands in _shot_err."""
-    global _shot_err
+    PIL Image or None; failure reason lands in _shot_err.
+
+    v2.18: switched from PIL's ImageGrab to the `mss` library. Both ultimately
+    go through the same Windows GDI BitBlt/GetDIBits calls, but ImageGrab has
+    long-standing, still-open upstream reports of not releasing every GDI
+    handle/device-context it creates on repeated calls (Pillow #1601, #2631,
+    #5536) — and Live View calls this every 1.5s for as long as it's open, on
+    some PCs for hours at a stretch. GDI/USER handles are a SESSION-WIDE
+    shared pool ("desktop heap"), so a slow leak there doesn't just break this
+    process — it can degrade or crash the whole interactive session (explorer
+    restarts, black screens, forced reboots) on affected machines, especially
+    older/weaker GPU drivers. mss explicitly deletes its device context and
+    bitmap objects after every grab, which is exactly the cleanup step
+    ImageGrab is reported to sometimes skip. One mss context is created once
+    and reused (context creation itself does a little GDI setup that's
+    wasteful to repeat every 1.5s) but forcibly recycled every 500 grabs as a
+    defense-in-depth against any slow internal drift, in addition to being
+    torn down and rebuilt immediately on any capture error (e.g. a monitor
+    being plugged/unplugged mid-session leaving it in a stale state)."""
+    global _shot_err, _mss_inst, _mss_grabs
     try:
-        from PIL import ImageGrab
-        img = ImageGrab.grab(all_screens=True)
-        if img is None:
-            _shot_err = 'ImageGrab.grab() returned None'; return None
+        import mss
+        from PIL import Image
+        if _mss_inst is not None and _mss_grabs >= 500:
+            try: _mss_inst.close()
+            except Exception: pass
+            _mss_inst = None
+        if _mss_inst is None:
+            _mss_inst = mss.mss()
+            _mss_grabs = 0
+        shot = _mss_inst.grab(_mss_inst.monitors[0])   # index 0 = full virtual bounding box, all monitors
+        _mss_grabs += 1
+        img = Image.frombytes('RGB', shot.size, shot.rgb)
         _shot_err = ''
         return img
     except Exception as ex:
         _shot_err = '%s: %s' % (type(ex).__name__, ex)
+        log.error('screen capture failed, resetting mss context: %s', _shot_err)
+        try:
+            if _mss_inst is not None:
+                _mss_inst.close()
+        except Exception:
+            pass
+        _mss_inst = None   # next call gets a fresh context instead of repeating the same failure forever
         return None
 
 
@@ -1587,8 +1676,9 @@ class Tracker:
     def send_live_frame(self):
         """Capture + upload one live-view frame — the screen, or the WEBCAM in
         camera mode. Runs every 1.5s for as long as Live View is open, which
-        makes this the single most repeated caller of ImageGrab.grab() in the
-        whole agent. Grab (or webcam read) stays on the calling thread as
+        makes this the single most repeated caller of _grab_raw() in the
+        whole agent (see its v2.18 note on why that's exactly the path that
+        motivated moving off ImageGrab). Grab (or webcam read) stays on the calling thread as
         always (that part is safe — see v2.11); v2.14 also moved the
         resize+encode + upload to the background thread (webcam frames were
         already cheap via cv2 so this mainly matters for the screen-capture
@@ -1737,6 +1827,7 @@ class Tracker:
                 self.queue = batch + self.queue
 
     def run(self):
+        log.info('agent starting: version=%s pid=%s', APP_VERSION, os.getpid())
         self.maybe_update()       # self-update on startup if a newer exe is out
         self.fetch_config()
         self.fetch_policy()
@@ -1744,7 +1835,8 @@ class Tracker:
         self.run_detectors()      # establish baselines (no events on first pass)
         self.scan_software()
         last_upload = last_health = last_shot = last_sw = last_pcheck = last_det = time.time()
-        last_upd = time.time()
+        last_upd = last_beat = time.time()
+        was_live = False
         while self.token:
             try:
                 if _locally_blocked():
@@ -1770,6 +1862,9 @@ class Tracker:
                     self.check_pending()
                     last_pcheck = now
                     live = now < self._live_until
+                if live != was_live:
+                    log.info('live view %s', 'started' if live else 'stopped')
+                    was_live = live
                 if live:
                     self.send_live_frame()
                 if self.screenshots_enabled and self.shot_int > 0 and now - last_shot >= self.shot_int:
@@ -1789,7 +1884,11 @@ class Tracker:
                 if now - last_upd >= 6 * 3600:        # check for a new exe every 6h
                     self.maybe_update()
                     last_upd = now
+                if now - last_beat >= 600:   # one "still alive" line every 10 min — cheap breadcrumb
+                    log.info('alive: uptime_ok, live=%s', live)   # so a crash shows as a gap, not silence from the start
+                    last_beat = now
             except Exception as ex:
+                log.exception('main loop error')
                 self.report_error('%s: %s' % (type(ex).__name__, ex))
             time.sleep(1.5 if time.time() < self._live_until else self.sample_int)
 

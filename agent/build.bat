@@ -13,7 +13,8 @@ pyinstaller --noconsole --onefile --name winMon ^
   --hidden-import win32gui --hidden-import win32process --hidden-import win32api ^
   --hidden-import win32file --hidden-import win32print --hidden-import winreg ^
   --hidden-import psutil --hidden-import uiautomation ^
-  --hidden-import PIL.ImageGrab --hidden-import pynput.keyboard --hidden-import pynput.mouse ^
+  --hidden-import PIL.ImageGrab --hidden-import mss --hidden-import mss.windows ^
+  --hidden-import pynput.keyboard --hidden-import pynput.mouse ^
   agent.py
 
 echo.

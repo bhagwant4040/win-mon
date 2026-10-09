@@ -51,7 +51,6 @@ jobs:
           --collect-all PIL
           --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin
           --hidden-import mss --hidden-import mss.windows
-          --hidden-import pynput.keyboard --hidden-import pynput.mouse
           --collect-all sounddevice --collect-all numpy
           --hidden-import websocket --hidden-import numpy
           --collect-all cv2 --hidden-import cv2

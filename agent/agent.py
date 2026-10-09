@@ -25,7 +25,7 @@ import queue as _queue
 
 import requests
 
-APP_VERSION = '2.18'
+APP_VERSION = '2.19'
 DEFAULT_SERVER = 'https://ems.rajivsyndicate.com'
 
 # Self-update: the exe is published as a GitHub Release; the agent checks the
@@ -989,9 +989,35 @@ def get_browser_url(app, title=''):
     return url
 
 
-# ── activity intensity (keystroke + mouse-click COUNTS only, never content) ────
-_key_count = 0
-_click_count = 0
+# ── activity intensity — HOOK-FREE (v2.19) ────────────────────────────────────
+# Until v2.19 this used pynput's keyboard.Listener/mouse.Listener, which install
+# global low-level Windows hooks (WH_KEYBOARD_LL / WH_MOUSE_LL). Those are the
+# single worst thing this agent did, for two independent reasons:
+#
+#  1. SYSTEM-WIDE LAG. A low-level keyboard hook is synchronous and global:
+#     Windows routes EVERY keystroke on the whole PC through this process's hook
+#     callback BEFORE the focused app receives it. The callback is Python, so it
+#     needs the GIL — and this is an ~83MB process constantly doing something
+#     that holds the GIL (opencv, Pillow, psutil, UIA/COM, numpy, requests, Tk).
+#     Whenever any of that holds the GIL, the hook can't return promptly and ALL
+#     input on the machine stalls (up to Windows' 300ms LowLevelHooksTimeout,
+#     after which Windows silently drops the hook). v2.10–v2.18 each removed one
+#     more GIL-holding operation, but the mechanism guarantees there is always
+#     another — the only real fix is to not sit on the input path at all.
+#
+#  2. DEFENDER. A global WH_KEYBOARD_LL hook is THE classic keylogger signature
+#     and the main reason Defender/AV flag this exe. Removing it is the biggest
+#     single step toward not being treated as a threat.
+#
+# Replacement needs no hook: poll GetLastInputInfo (the same cheap API already
+# used for idle detection) about once a second on a dedicated thread, and count
+# a "second of activity" whenever input happened recently. This yields
+# active-seconds-per-app — the activity metric commercial monitors actually show
+# — with zero input-path involvement, zero system lag, and zero keylog signature.
+# GetLastInputInfo can't distinguish a key from a click, so the old keys-vs-
+# clicks split is gone by design; the server still receives a 'keys' field (now
+# carrying active-seconds) so no schema/endpoint change is needed.
+_active_seconds = 0
 _intensity_on = False
 
 
@@ -999,23 +1025,23 @@ def start_intensity():
     global _intensity_on
     if _intensity_on:
         return
-    try:
-        from pynput import keyboard, mouse
+    _intensity_on = True
 
-        def on_press(_k):
-            global _key_count
-            _key_count += 1
+    def _poll():
+        global _active_seconds
+        last = None
+        while True:
+            try:
+                # Active if there was input within the poll window. 1.5s window
+                # against a ~1s poll so a brief gap between keystrokes still
+                # counts as continuous activity.
+                if get_idle_seconds() < 2:
+                    _active_seconds += 1
+            except Exception:
+                pass
+            time.sleep(1.0)
 
-        def on_click(_x, _y, _button, pressed):
-            global _click_count
-            if pressed:
-                _click_count += 1
-
-        keyboard.Listener(on_press=on_press).start()
-        mouse.Listener(on_click=on_click).start()
-        _intensity_on = True
-    except Exception:
-        pass
+    threading.Thread(target=_poll, daemon=True).start()
 
 
 _shot_err = ''
@@ -1595,7 +1621,7 @@ class Tracker:
                 app, title, url = app, '[blocked] ' + (title or ''), url
         now = time.time()
         newseg = {'app': app, 'title': title, 'url': url, 'idle': idle, 'start': now,
-                  'kb': _key_count, 'cb': _click_count}   # intensity baselines
+                  'kb': _active_seconds}   # active-seconds baseline (hook-free intensity)
         with self.lock:
             if self.cur is None:
                 self.cur = newseg
@@ -1605,8 +1631,10 @@ class Tracker:
 
     def _close(self, end_ts):
         if self.cur and end_ts > self.cur['start'] + 0.5:
-            keys = max(0, _key_count - self.cur.get('kb', _key_count))
-            clicks = max(0, _click_count - self.cur.get('cb', _click_count))
+            # 'keys' now carries active-seconds (see start_intensity); the
+            # server stores it in its existing key_count column unchanged.
+            keys = max(0, _active_seconds - self.cur.get('kb', _active_seconds))
+            clicks = 0
             self.queue.append({
                 'app': self.cur['app'], 'title': self.cur['title'], 'url': self.cur['url'],
                 'idle': self.cur['idle'], 'start': self.cur['start'], 'end': end_ts,
@@ -1801,8 +1829,7 @@ class Tracker:
             self._close(now)
             if self.cur:
                 self.cur['start'] = now
-                self.cur['kb'] = _key_count
-                self.cur['cb'] = _click_count
+                self.cur['kb'] = _active_seconds
             batch = self.queue[:]
             self.queue = []
         if not batch:
